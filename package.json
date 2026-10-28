@@ -1,6 +1,6 @@
 {
     "name": "@huloglobal/vendure-plugin-email-tracking",
-    "version": "0.15.1",
+    "version": "0.15.2",
     "description": "Track delivery, opens and clicks on every transactional email a Vendure server sends. Wraps the @vendure/email-plugin pipeline plus an exposed helper for plugin-authored sends, persists every event to a dedicated EmailLog table, and ships an admin UI for per-customer / per-order audit trails.",
     "license": "AGPL-3.0-or-later",
     "author": "Wayne Garrison <wayne@garrison.me.uk>",

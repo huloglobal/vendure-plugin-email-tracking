@@ -112,7 +112,7 @@ interface EmailDetail extends EmailRow {
                     <div class="lic-sub" *ngIf="licMeta.recentStats?.length"><strong>So far:</strong> {{ statsLine() }}</div>
                 </div>
                 <div *ngIf="licMeta.tier !== 'trial'">
-                    <strong>🔓 Free tier</strong> — premium features need a licence. Start your <strong>14-day free trial</strong> below (card required, nothing charged until day 15, cancel any time) or buy a lifetime licence. Premium features are paused; your configuration is kept and reactivates instantly with a key.
+                    <strong>🔓 Free tier</strong> — premium features need a licence. Subscribe below (monthly or annual, cancel any time) or buy a lifetime licence. Premium features are paused; your configuration is kept and reactivates instantly with a key.
                     <div class="lic-sub" *ngIf="licMeta.premiumFeatures?.length">Switch on with a licence: {{ licMeta.premiumFeatures.join(' · ') }}</div>
                     <div class="lic-sub" *ngIf="licMeta.recentStats?.length"><strong>{{ licMeta.eval?.source === 'server' ? 'During your evaluation:' : 'So far:' }}</strong> {{ statsLine() }}</div>
                 </div>
@@ -124,8 +124,8 @@ interface EmailDetail extends EmailRow {
                     <span *ngIf="licMeta.tier === 'trial' && remindMeSent" style="font-size:12.5px;font-weight:600">✓ We'll email you before it ends</span>
                     <input class="lic-key" type="text" placeholder="Paste licence key (eyJhbGciOi…)" [(ngModel)]="licKeyInput" [disabled]="licActivating">
                     <button class="gbtn gbtn-primary gbtn-sm" (click)="activateLicence()" [disabled]="licActivating || !licKeyInput">{{ licActivating ? 'Verifying…' : 'Activate' }}</button>
-                    <select [(ngModel)]="buyPlan" [disabled]="buying" style="padding:5px 9px;border:1px solid #d1d5db;border-radius:7px;font-size:12.5px;background:#fff;color:inherit"><option value="monthly">Monthly · 14-day free trial</option><option value="annual">Annual · 14-day free trial, 2 months free</option><option value="lifetime">Lifetime · one-off</option></select>
-                    <button class="gbtn gbtn-primary gbtn-sm" (click)="buyLicence()" [disabled]="buying">{{ buying ? 'Opening checkout…' : (buyPlan === 'lifetime' ? 'Buy lifetime →' : 'Start 14-day free trial →') }}</button>
+                    <select [(ngModel)]="buyPlan" [disabled]="buying" style="padding:5px 9px;border:1px solid #d1d5db;border-radius:7px;font-size:12.5px;background:#fff;color:inherit"><option value="monthly">Monthly</option><option value="annual">Annual · 2 months free</option><option value="lifetime">Lifetime · one-off</option></select>
+                    <button class="gbtn gbtn-primary gbtn-sm" (click)="buyLicence()" [disabled]="buying">{{ buying ? 'Opening checkout…' : (buyPlan === 'lifetime' ? 'Buy lifetime →' : (licMeta?.tier === 'trial' ? 'Subscribe — first charge when the evaluation ends →' : 'Subscribe →')) }}</button>
                     <span *ngIf="claim?.state === 'pending'" style="font-size:12.5px;font-weight:600">⏳ Waiting for checkout to finish — the licence installs itself. <a (click)="checkClaim(true)" style="cursor:pointer;text-decoration:underline">Check now</a></span>
                     <a href="https://huloglobal.com/vendure-plugins/email-tracking/" target="_blank" class="gbtn gbtn-outline gbtn-sm">Details ↗</a>
                 </div>
