@@ -4,10 +4,10 @@
     "description": "Track delivery, opens and clicks on every transactional email a Vendure server sends. Wraps the @vendure/email-plugin pipeline plus an exposed helper for plugin-authored sends, persists every event to a dedicated EmailLog table, and ships an admin UI for per-customer / per-order audit trails.",
     "license": "AGPL-3.0-or-later",
     "author": "Wayne Garrison <wayne@garrison.me.uk>",
-    "homepage": "https://github.com/exceeded/vendure-plugin-email-tracking",
+    "homepage": "https://github.com/huloglobal/vendure-plugin-email-tracking",
     "repository": {
         "type": "git",
-        "url": "git+https://github.com/exceeded/vendure-plugin-email-tracking.git"
+        "url": "git+https://github.com/huloglobal/vendure-plugin-email-tracking.git"
     },
     "main": "dist/index.js",
     "types": "dist/index.d.ts",
