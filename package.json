@@ -1,6 +1,6 @@
 {
     "name": "@huloglobal/vendure-plugin-email-tracking",
-    "version": "0.15.2",
+    "version": "0.15.3",
     "description": "Track delivery, opens and clicks on every transactional email a Vendure server sends. Wraps the @vendure/email-plugin pipeline plus an exposed helper for plugin-authored sends, persists every event to a dedicated EmailLog table, and ships an admin UI for per-customer / per-order audit trails.",
     "license": "AGPL-3.0-or-later",
     "author": "Wayne Garrison <wayne@garrison.me.uk>",
@@ -30,7 +30,7 @@
     },
     "dependencies": {
         "graphql-tag": "^2.12.7",
-        "@huloglobal/vendure-licence-sdk": "^0.15.1"
+        "@huloglobal/vendure-licence-sdk": "^0.15.2"
     },
     "peerDependencies": {
         "@nestjs/common": ">=10.0.0",
@@ -40,7 +40,7 @@
         "typeorm": ">=0.3.0"
     },
     "devDependencies": {
-        "@huloglobal/vendure-licence-sdk": "^0.15.1",
+        "@huloglobal/vendure-licence-sdk": "^0.15.2",
         "@nestjs/common": "^10.0.0",
         "@types/nodemailer": "^6.0.0",
         "@vendure/core": "^3.7.3",

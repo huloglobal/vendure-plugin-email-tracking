@@ -15,10 +15,18 @@ describe('getRealIp', () => {
         expect(getRealIp(req({ 'cf-connecting-ip': '1.1.1.1', 'x-real-ip': '3.3.3.3' }, '5.5.5.5'), [...all])).toBe('1.1.1.1');
         expect(getRealIp(req({ 'true-client-ip': '2.2.2.2', 'x-real-ip': '3.3.3.3' }), [...all])).toBe('2.2.2.2');
         expect(getRealIp(req({ 'x-real-ip': '3.3.3.3' }), [...all])).toBe('3.3.3.3');
-        expect(getRealIp(req({ 'x-forwarded-for': '4.4.4.4, 9.9.9.9' }), ['x-forwarded-for'])).toBe('4.4.4.4');
+        expect(getRealIp(req({ 'x-forwarded-for': '4.4.4.4' }), ['x-forwarded-for'])).toBe('4.4.4.4');
     });
-    it('uses the left-most XFF entry when XFF is trusted and strips the IPv4-mapped prefix', () => {
+    it('takes the right-most public XFF hop: entries the client sent itself cannot pick the IP', () => {
+        // Client sent "X-Forwarded-For: 1.2.3.4"; the trusted proxy appended the real peer.
+        expect(getRealIp(req({ 'x-forwarded-for': '1.2.3.4, 198.51.100.7' }), ['x-forwarded-for'])).toBe('198.51.100.7');
+        // A fresh spoofed value per request must not mint a fresh rate-limit bucket.
+        const seen = new Set([1, 2, 3].map(n => getRealIp(req({ 'x-forwarded-for': `9.9.9.${n}, 198.51.100.7` }), ['x-forwarded-for'])));
+        expect([...seen]).toEqual(['198.51.100.7']);
+    });
+    it('skips our own private proxy hops in XFF and strips the IPv4-mapped prefix', () => {
         expect(getRealIp(req({ 'x-forwarded-for': '  203.0.113.1 , 10.0.0.1 , 10.0.0.2 ' }), ['x-forwarded-for'])).toBe('203.0.113.1');
+        expect(getRealIp(req({ 'x-forwarded-for': '6.6.6.6, ::ffff:203.0.113.5, 192.168.1.25' }), ['x-forwarded-for'])).toBe('203.0.113.5');
         expect(getRealIp(req({}, '::ffff:203.0.113.9'))).toBe('203.0.113.9');
     });
     it('falls back to req.ip then null', () => {

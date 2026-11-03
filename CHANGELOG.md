@@ -5,6 +5,33 @@ documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) and this project
 adheres to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.15.3] — 2026-11-03
+
+### Security
+- **Open redirect through signed click links.** The `<id>.<hmac>` token on
+  `/email-track/click/:token?u=…` authenticated only the email, not the
+  destination, so anyone holding one tracked email (or any link from it)
+  could swap `u` for any http(s) URL and use the shop's domain to redirect to
+  a phishing site whenever `clickRedirectAllowedDomains` was empty (the
+  default). Rewritten links now carry `s`, an HMAC over the token and the
+  destination; a link without a valid `s` (bare legacy ids, and links in
+  emails sent before 0.15.3) only redirects to the shop's own hosts
+  (`publicBaseUrl`, `trackedHosts`, `clickRedirectAllowedDomains`).
+  Behaviour change: old emails whose links point at third-party sites now
+  get a 400 for those links; add the domains to `clickRedirectAllowedDomains`
+  to keep them working.
+- **Client IP from `X-Forwarded-For`.** With `trustedIpHeaders` including
+  `x-forwarded-for`, the left-most entry (written by the client itself) was
+  used, so a fresh spoofed value per request bypassed the per-IP rate limit
+  on the pixel, click and bounce endpoints and poisoned stored open/click
+  IPs. The right-most public hop (the one your proxy appended) is used now.
+- **Channel scoping of single-row reads.** `GET /email-track/log/:id` and the
+  `huloEmailLog` / `huloEmailStatsByTemplate` admin queries ignored the
+  channel scope the list views apply, so a channel admin with `ReadCustomer`
+  could read another channel's emails (recipient, subject, context, opens and
+  clicks) by id. They now see only their channel; the default channel still
+  sees everything.
+
 ## [0.15.2] — 2026-10-28
 
 ### Changed

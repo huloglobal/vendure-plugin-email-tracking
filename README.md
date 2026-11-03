@@ -89,7 +89,10 @@ your own plugin code and get the same engagement tracking.
   secret) and forged ids are rejected.
 - **Click redirector** at `/email-track/click/:token?u=…` — skips
   `mailto:`, `tel:`, `#`-anchors, and `unsubscribe`/`opt-out` links.
-  Optional `clickRedirectAllowedDomains` denies open-redirector abuse.
+  Each rewritten link carries `s`, an HMAC over the token and `u`, so the
+  destination cannot be swapped; links without a valid `s` only redirect
+  to the shop's own hosts. Optional `clickRedirectAllowedDomains` narrows
+  the allowed destinations further.
   Per-link tokens minted with `EmailLinkService.issueLinkToken()` (64-hex,
   `?u=…&s=<hmac>`) are honoured too: the row must exist and be unexpired,
   and both the signature and the stored destination hash must match `u`,

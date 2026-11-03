@@ -8,9 +8,9 @@ import { Request } from 'express';
  *      regardless of how many proxies sit in front of the worker).
  *   2. `True-Client-IP` (Akamai / Cloudflare Enterprise).
  *   3. `X-Real-IP` (nginx / Caddy default when proxying).
- *   4. First entry in `X-Forwarded-For` (RFC 7239 ancestor; the
- *      left-most entry is the original client when the upstream proxy
- *      is trusted).
+ *   4. `X-Forwarded-For`: the right-most public hop, i.e. the address
+ *      your own proxy appended. Every entry left of it was sent by the
+ *      client and is never trusted.
  *   5. Express's `req.ip` — only useful when `app.set('trust proxy', ...)`
  *      has been set on the Vendure host, otherwise this is the socket
  *      address of the last hop.
@@ -20,6 +20,19 @@ import { Request } from 'express';
  * skip IP-dependent enrichment rather than fail.
  */
 export type TrustedIpHeader = 'cf-connecting-ip' | 'true-client-ip' | 'x-real-ip' | 'x-forwarded-for';
+
+const PRIVATE_HOP = /^(10\.|127\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|169\.254\.|::1$|f[cd][0-9a-f]{2}:|fe80:)/i;
+
+/** Right-most hop that is not one of our own (private / loopback)
+ *  proxies. The left-most entry is whatever the client put in its own
+ *  X-Forwarded-For header, so trusting it lets anyone pick their IP. */
+function clientFromXff(raw: string): string {
+    const hops = raw.split(',').map(h => h.trim().replace(/^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i, '$1')).filter(Boolean);
+    for (let i = hops.length - 1; i >= 0; i--) {
+        if (!PRIVATE_HOP.test(hops[i])) return hops[i];
+    }
+    return hops[hops.length - 1] || '';
+}
 
 /**
  * The visitor's IP: Express's `req.ip` (honours the host's `trust proxy`)
@@ -32,7 +45,7 @@ export function getRealIp(req: Request, trusted: TrustedIpHeader[] = []): string
     for (const name of trusted) {
         const raw = String(headers[name] || '').trim();
         if (!raw) continue;
-        const value = name === 'x-forwarded-for' ? raw.split(',')[0]?.trim() : raw;
+        const value = name === 'x-forwarded-for' ? clientFromXff(raw) : raw;
         if (value) return value.replace(/^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i, '$1').slice(0, 64);
     }
     const ip = String((req as any).ip || '').trim();

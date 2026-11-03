@@ -43,7 +43,9 @@ export interface EmailTrackingPluginOptions {
     allowUnauthenticatedBounceWebhook?: boolean;
     /** Proxy headers that may override `req.ip` for the visitor address.
      *  Only list what your edge sets and strips from clients, e.g.
-     *  `['cf-connecting-ip']` behind Cloudflare. Default: none (`req.ip`). */
+     *  `['cf-connecting-ip']` behind Cloudflare. Default: none (`req.ip`).
+     *  `x-forwarded-for` yields the right-most public hop (the one your
+     *  proxy appended), never the client-supplied left-most entry. */
     trustedIpHeaders?: Array<'cf-connecting-ip' | 'true-client-ip' | 'x-real-ip' | 'x-forwarded-for'>;
 
     /**

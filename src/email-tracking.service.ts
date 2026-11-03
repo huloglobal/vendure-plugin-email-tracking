@@ -12,6 +12,7 @@ import { lookupGeo } from './geo-lookup';
 import { getLicenceStatus, getOptions, ownTrackingPrefixes, trackingBaseUrl, hasPremiumAccess, getEvalState, configuredSigningSecret, setStatsProvider } from './options';
 import { parseEmailClient } from './parse-ua';
 import { decodeHtmlHref } from './decode-html-href';
+import { trackedClickHref } from './click-signature';
 
 const loggerCtx = 'EmailTrackingService';
 
@@ -536,9 +537,8 @@ export class EmailTrackingService implements OnApplicationBootstrap, OnModuleDes
             if (ownPrefixes.some(p => trimmed.startsWith(p))) return match;
             if (/unsubscribe/i.test(trimmed) || /\bopt[-_]?out\b/i.test(trimmed)) return match;
             // Decode HTML-escaped query separators before encoding the target.
-            const target = decodeHtmlHref(trimmed);
-            const encoded = encodeURIComponent(target);
-            return `<a${attrs}href=${quote}${base}/email-track/click/${token}?u=${encoded}${quote}`;
+            const target = decodeHtmlHref(trimmed).trim();
+            return `<a${attrs}href=${quote}${trackedClickHref(base, token, target, getOptions().signingSecret)}${quote}`;
         });
     }
 

@@ -116,6 +116,12 @@ export const emailTrackingAdminApiSchema = gql`
     }
 `;
 
+/** The channel an admin read is scoped to: null for the default channel (sees everything). */
+function channelScope(ctx: RequestContext): number | null {
+    if (!ctx?.channelId || ctx.channel?.code === '__default_channel__' || String(ctx.channelId) === '1') return null;
+    return Number(ctx.channelId);
+}
+
 @Resolver()
 @Injectable()
 export class EmailTrackingAdminResolver {
@@ -142,7 +148,8 @@ export class EmailTrackingAdminResolver {
         if (f.recipient)  { where.push('recipient LIKE ?'); params.push(`%${String(f.recipient).slice(0, 190).replace(/[\\%_]/g, m => '\\' + m)}%`); }
         if (f.from && !Number.isNaN(new Date(f.from).getTime())) { where.push('\`createdAt\` >= ?'); params.push(new Date(f.from)); }
         if (f.to && !Number.isNaN(new Date(f.to).getTime()))     { where.push('\`createdAt\` <= ?'); params.push(new Date(f.to)); }
-        if (ctx.channelId && ctx.channel?.code !== '__default_channel__' && String(ctx.channelId) !== '1') { where.push('\`channelId\` = ?'); params.push(Number(ctx.channelId)); }
+        const scope = channelScope(ctx);
+        if (scope) { where.push('\`channelId\` = ?'); params.push(scope); }
         const w = where.length ? ` WHERE ${where.join(' AND ')}` : '';
 
         const items = await adapterFor(this.connection.rawConnection).query(
@@ -160,19 +167,23 @@ export class EmailTrackingAdminResolver {
 
     @Query()
     @Allow(Permission.ReadCustomer)
-    async huloEmailLog(@Args('id') id: string): Promise<any> {
+    async huloEmailLog(@Ctx() ctx: RequestContext, @Args('id') id: string): Promise<any> {
         const repo = this.connection.rawConnection.getRepository(EmailLog);
         const row = await repo.findOne({ where: { id: Number(id) } as any });
-        return row || null;
+        // Same channel scope as huloEmailLogs.
+        const scope = channelScope(ctx);
+        if (!row || (scope && Number(row.channelId) !== scope)) return null;
+        return row;
     }
 
     @Query()
     @Allow(Permission.ReadCustomer)
-    async huloEmailStatsByTemplate(@Args('days') daysInput?: number): Promise<any> {
+    async huloEmailStatsByTemplate(@Ctx() ctx: RequestContext, @Args('days') daysInput?: number): Promise<any> {
         if (!hasPremiumAccess()) {
             throw new Error(premiumFeatureError('vendure-plugin-email-tracking').message);
         }
         const days = Math.min(Math.max(Number(daysInput) || 30, 1), 365);
+        const scope = channelScope(ctx);
         const rows = await adapterFor(this.connection.rawConnection).query(
             `SELECT type,
                     COUNT(*)                                                                AS sent,
@@ -184,10 +195,10 @@ export class EmailTrackingAdminResolver {
                     SUM(\`openCount\`)                                                       AS totalOpens,
                     SUM(\`clickCount\`)                                                      AS totalClicks
              FROM email_log
-             WHERE \`createdAt\` >= DATE_SUB(NOW(), INTERVAL ? DAY)
+             WHERE \`createdAt\` >= DATE_SUB(NOW(), INTERVAL ? DAY)${scope ? ' AND \`channelId\` = ?' : ''}
              GROUP BY type
              ORDER BY sent DESC`,
-            [days],
+            scope ? [days, scope] : [days],
         );
         return {
             days,

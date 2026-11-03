@@ -47,6 +47,7 @@ const ONE_PX_GIF = Buffer.from(
 );
 
 import { getRealIp } from './proxy-headers';
+import { verifyClickSignature } from './click-signature';
 
 const PLUGIN_ID_FOR_STORE = 'vendure-plugin-email-tracking';
 function realIp(req: Request): string | null { return getRealIp(req, getOptions().trustedIpHeaders || []); }
@@ -380,7 +381,7 @@ export class EmailTrackingController {
             return res.status(429).send('Too many requests');
         }
 
-        const url = (u || '').trim();
+        const url = (typeof u === 'string' ? u : '').trim();
         const opts = getOptions();
         // Defence in depth: reject non-http(s) and any host that isn't on
         // the allowlist when one is configured. Stops the redirector
@@ -399,11 +400,16 @@ export class EmailTrackingController {
             applySecurityHeaders(res);
             return res.status(404).send('Unknown link');
         }
-        if (!opts.signingSecret || !/\./.test(token)) {
+        // The `<id>.<hmac>` token only proves which email this is; `s` binds
+        // the destination. Without a valid `s` (bare legacy ids, and signed
+        // links rewritten before 0.15.3) only the shop's own hosts are reachable.
+        const destinationSigned = !!opts.signingSecret && token.includes('.')
+            && verifyClickSignature(token, url, sig, opts.signingSecret);
+        if (!destinationSigned) {
             const own = ownHosts();
             let host = '';
             try { host = new URL(url).hostname.toLowerCase(); } catch { /* rejected above */ }
-            if (own.length && !own.some(h => host === h || host.endsWith(`.${h}`))) {
+            if (!own.some(h => host === h || host.endsWith(`.${h}`))) {
                 applySecurityHeaders(res);
                 return res.status(400).send('Invalid redirect target');
             }
@@ -616,7 +622,9 @@ export class EmailTrackingController {
         const id = parseInt(idParam, 10);
         if (!id) return res.status(400).json({ error: 'Invalid id' });
         const row = await this.connection.rawConnection.getRepository(EmailLog).findOne({ where: { id } });
-        if (!row) return res.status(404).json({ error: 'Not found' });
+        // Same channel scope as the list: a channel admin never reads another channel's email.
+        const scope = scopedChannel(ctx);
+        if (!row || (scope && Number(row.channelId) !== scope)) return res.status(404).json({ error: 'Not found' });
         let clicks: any[] = [];
         let opens: any[] = [];
         try { clicks = JSON.parse(row.clicksJson || '[]'); } catch {}

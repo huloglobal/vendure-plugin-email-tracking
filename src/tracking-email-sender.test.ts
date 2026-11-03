@@ -4,6 +4,7 @@ import { describe, expect, it, vi } from 'vitest';
 vi.mock('./email-log.entity', () => ({ EmailLog: class EmailLog {} }));
 import { CapturingSender, TrackingEmailSender, statusFromSmtpResponse } from './tracking-email-sender';
 import { setOptions } from './options';
+import { verifyClickSignature } from './click-signature';
 
 describe('CapturingSender', () => {
     it('keeps nodemailer info on the EmailDetails of that send only', async () => {
@@ -44,6 +45,15 @@ describe('TrackingEmailSender via the Vendure pipeline', () => {
         ]);
         expect(new URL(targets[0]!).searchParams.get('token')).toBe('example');
         expect(new URL(targets[1]!).searchParams.get('b')).toBe('2');
+    });
+
+    it('binds every rewritten link to its destination (s = HMAC over token and u)', () => {
+        setOptions({ publicBaseUrl: 'https://track.example.com', signingSecret: 'test-secret' });
+        const rewritten = (new TrackingEmailSender() as any).wrapHtml('<a href="https://partner.example/x?a=1&amp;b=2">x</a>', 7);
+        const href = new URL(/href="([^"]+)"/.exec(rewritten)![1]);
+        const token = href.pathname.split('/').pop()!;
+        expect(verifyClickSignature(token, href.searchParams.get('u')!, href.searchParams.get('s'), 'test-secret')).toBe(true);
+        expect(verifyClickSignature(token, 'https://evil.example/', href.searchParams.get('s'), 'test-secret')).toBe(false);
     });
 
     it('records Message-ID (without brackets) and the SMTP response on the row after inner.send', async () => {
