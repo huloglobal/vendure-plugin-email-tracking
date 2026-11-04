@@ -1,3 +1,5 @@
+<p align="center"><a href="https://huloglobal.com/vendure-plugins/email-tracking/"><img src="https://huloglobal.com/vendure-plugins/logos/email-tracking.svg" width="96" height="96" alt="HULO Email Tracking logo"></a></p>
+
 # @huloglobal/vendure-plugin-email-tracking
 
 Track delivery, opens and clicks on every transactional email a Vendure
