@@ -1,12 +1,80 @@
 import { EvaluationClient, EvaluationState, EvalStatsProvider, LicenceStatus, RetentionOptions } from '@huloglobal/vendure-licence-sdk';
+import type { IpEnrichmentOptions } from './ip-enrichment';
+
+/**
+ * Provider delivery webhooks at `POST /email-track/webhook/:provider`
+ * (0.16.0). Each provider is off until configured. Every known provider
+ * slug goes through the same body checks whether it is configured or not
+ * (415 / 413 / 408, and 400 for a Mailgun or SES body nested deeper than 32
+ * levels or with more than 1 000 arrays and objects; caps 1 MB SendGrid and
+ * Postmark, 320 KB SES, 256 KB Mailgun), and an unconfigured provider
+ * answers 401 exactly like a bad signature — same body read, same empty
+ * body, same headers, after the same signature check run against throwaway
+ * credentials — so nothing reveals which ones are enabled. Configuring a
+ * provider also adds its correlation header to outgoing mail — a signed
+ * correlation value, `<email_log id>-<HMAC>` — so its events match the
+ * email.
+ */
+export interface ProviderWebhookOptions {
+    /** Postmark: HTTP Basic credentials you put in the webhook URL
+     *  (`https://user:pass@shop.example.com/email-track/webhook/postmark`). */
+    postmark?: { username: string; password: string };
+    /** SendGrid Event Webhook "Signed Event Webhook" verification key, as
+     *  shown in SendGrid's UI (base64 DER) or as a PEM public key. */
+    sendgrid?: { verificationKey: string };
+    /** Mailgun HTTP webhook signing key (Settings → Webhooks). Mailgun signs only
+     *  timestamp + token, so each token is accepted once (per server process)
+     *  within the ±15-minute window. */
+    mailgun?: { signingKey: string };
+    /**
+     * Amazon SES notifications through SNS. Only messages whose signed
+     * `TopicArn` is listed are accepted (full ARNs, `arn:aws:sns:<region>:<account>:<name>`);
+     * the signing certificate must come from that topic's own region,
+     * `sns.<region>.amazonaws.com` (fetched at most 2 new URLs a minute per
+     * client address and 60 in all, then cached). `autoConfirmSubscription`
+     * (default true) visits the SNS `SubscribeURL` after the confirmation
+     * message has been verified; false logs it for you to confirm by hand.
+     */
+    ses?: { topicArns: string[]; autoConfirmSubscription?: boolean };
+    /**
+     * Also record the opens and clicks a provider reports. Default false:
+     * the plugin's own pixel and redirector already record them, so provider
+     * engagement is ignored. When true they are added to the timeline as
+     * events (source = the provider) but never counted in `email_log`; a
+     * reported click URL is stored unwrapped (when it is one of the plugin's
+     * own tracked links) and with secrets redacted.
+     */
+    recordEngagement?: boolean;
+    /**
+     * Per-IP limits of this endpoint. `failed`: requests that fail a body
+     * check or verification (400, 401, 408, 413, 415) spend it, and an
+     * address that has used it up is answered 429 before its body is read
+     * (default: `rateLimit`, 60 per 60 s). `verified`: requests that pass
+     * verification spend only this one, per provider and address (default
+     * 1 200 per 60 s), so junk from anyone never throttles real bounces and
+     * complaints. Mailgun, Postmark and SNS post one request per event — size
+     * `verified` for your peak per provider IP; SNS retries an HTTPS endpoint
+     * only a few times before it drops a message (unless you give the
+     * subscription a longer delivery policy). Behind a reverse proxy, set
+     * `trustedIpHeaders` (or Express `trust proxy`): otherwise every
+     * request — the providers' included — shares the proxy's address.
+     */
+    rateLimit?: {
+        failed?: { capacity: number; windowMs: number };
+        verified?: { capacity: number; windowMs: number };
+    };
+}
 
 export interface EmailTrackingPluginOptions {
     /** Public host of the Vendure server. Embedded in outgoing pixel +
      *  click URLs. Example: `https://shop.example.com`. */
     publicBaseUrl: string;
 
-    /** Licence JWT. Without a valid key the plugin runs in
-     *  evaluation mode (basic logging, no tracking endpoints). */
+    /** Licence JWT. Without a valid key every feature is on for a 14-day
+     *  evaluation (no card); after it, the free tier: emails, send outcomes,
+     *  bounces, complaints and provider drops are still logged, while opens
+     *  and clicks are not recorded (the pixel and redirect endpoints still
+     *  answer) and the premium features are off. */
     licenceKey?: string;
 
     /** Hosts the click rewriter recognises as already-tracked. Defaults
@@ -28,7 +96,9 @@ export interface EmailTrackingPluginOptions {
      * it explicitly to keep already-sent links valid across reinstalls or
      * database restores. Links sent before any secret existed (bare ids)
      * keep working: the pixel is served and clicks redirect to your own
-     * hosts only. A generated secret is never used for the bounce webhook.
+     * hosts only. While a secret exists, a hit through a bare id is recorded
+     * as an `unverified` event only and never counted in `email_log` (anyone
+     * can type one). A generated secret is never used for the bounce webhook.
      */
     signingSecret?: string;
 
@@ -58,38 +128,73 @@ export interface EmailTrackingPluginOptions {
     clickRedirectAllowedDomains?: string[];
 
     /**
-     * Rate limit for the public tracking endpoints, keyed by IP. Two
-     * values: `{ capacity, windowMs }`. Default 60 requests / 60s.
+     * Rate limit for the public tracking endpoints (pixel, click redirect,
+     * bounce webhook, evidence PDF), keyed by IP. Two values:
+     * `{ capacity, windowMs }`. Default 60 requests / 60s. Also the default
+     * failure allowance of the provider webhooks (`providerWebhooks.rateLimit`).
      */
     rateLimit?: { capacity: number; windowMs: number };
 
     /**
-     * Per-install salt for hashing IPs stored in open / click history
-     * rows. Defaults to a process-static salt — set this in production
-     * so the hash is stable across deploys. */
+     * Secret salt for the IP hashes in `email_log`'s open / click history
+     * (`sha256(salt|ip)`) and the key of the `email_event` hashes (HMAC of the
+     * IP and of the recipient address). Unset, `email_log` uses a public
+     * default salt — anyone with a hash can recover the IP by trying every
+     * address — and `email_event` uses the install's signing secret; a boot
+     * warning says so. Set it to a long random value in production, and keep
+     * it stable (changing it changes every new hash). */
     ipSalt?: string;
 
     /**
-     * Store hashed IPs instead of raw IPs in open / click history. Hashed
-     * IPs still let you see "same network" patterns but can't be
-     * de-anonymised. Default: `true`.
+     * Store hashed IPs instead of raw IPs in open / click history and in
+     * `email_event.ip`. Hashed IPs still let you see "same network"
+     * patterns; with a secret `ipSalt` they cannot be reversed by trying
+     * addresses (with the default salt they can). Default: `true`.
      */
     hashIpsInHistory?: boolean;
 
     // ── Retention ───────────────────────────────────────────────────────
     /**
-     * Automatic pruning of the `email_log` table. `{ days: 180 }` keeps
-     * the last 180 days. `{ days: null }` (default) keeps everything.
-     * Optionally set `maxRows` as a safety cap. The sweeper runs every
-     * 24h and is unref'd so it never blocks shutdown.
+     * Automatic pruning of the `email_log` table. Default `{ days: 365 }`;
+     * `{ days: 180 }` keeps the last 180 days and `{ days: null }` keeps
+     * everything. Optionally set `maxRows` as a safety cap. The sweeper runs
+     * every 24h on the worker and is unref'd so it never blocks shutdown.
+     * The `email_event` timeline is pruned with the same `days` (at least 3,
+     * so a provider's replay window never outlives its dedupe row), with the
+     * events of the email rows `maxRows` removes, and — under `maxRows` —
+     * the unlinked events older than the oldest email kept.
      */
     retention?: RetentionOptions;
+
+    // ── Delivery + enrichment (0.16.0, all opt-in) ───────────────────────
+    /** Provider delivery webhooks (Postmark, SendGrid, Mailgun, Amazon SES).
+     *  Unset: every provider endpoint is refused (401, after the body
+     *  checks) and no header is added. */
+    providerWebhooks?: ProviderWebhookOptions;
+
+    /**
+     * IP enrichment for open and click events: an asynchronous lookup of
+     * country, region, city, ASN, organisation, timezone and proxy / VPN /
+     * datacentre / mobile flags. OFF unless set — with no value the plugin
+     * makes no third-party calls. Only the IP address is sent; private and
+     * reserved addresses never are. Results are cached per IP (`cacheTtlMs`,
+     * default 24 h) and lookups beyond `maxLookupsPerMinute` are dropped.
+     *
+     *   { provider: 'ipinfo', token }      https://ipinfo.io
+     *   { provider: 'ip-api', key? }       free endpoint without a key (HTTP,
+     *                                      45/min, non-commercial); pro with one
+     *   { provider: 'custom', lookup(ip) } your own source
+     */
+    ipEnrichment?: IpEnrichmentOptions;
 }
 
-const DEFAULTS: Required<Omit<EmailTrackingPluginOptions, 'licenceKey' | 'trackedHosts' | 'signingSecret' | 'bounceWebhookSecret' | 'clickRedirectAllowedDomains'>> = {
+/** The public salt used when `ipSalt` is not set (kept for the 0.15-compatible `email_log` hashes). */
+export const DEFAULT_IP_SALT = 'hulo-email-tracking-default-salt';
+
+const DEFAULTS: Required<Omit<EmailTrackingPluginOptions, 'licenceKey' | 'trackedHosts' | 'signingSecret' | 'bounceWebhookSecret' | 'clickRedirectAllowedDomains' | 'providerWebhooks' | 'ipEnrichment'>> = {
     publicBaseUrl: 'http://localhost:3000',
     rateLimit: { capacity: 60, windowMs: 60_000 },
-    ipSalt: 'hulo-email-tracking-default-salt',
+    ipSalt: DEFAULT_IP_SALT,
     hashIpsInHistory: true,
     retention: { days: 365 },
     allowUnauthenticatedBounceWebhook: false,
@@ -109,6 +214,21 @@ export function setOptions(opts: EmailTrackingPluginOptions): void {
 
 export function getOptions(): EmailTrackingPluginOptions {
     return cachedOptions;
+}
+
+/** True when no `ipSalt` was configured (the public default is in use). */
+export function isDefaultIpSalt(): boolean {
+    return !cachedOptions.ipSalt || cachedOptions.ipSalt === DEFAULT_IP_SALT;
+}
+
+/**
+ * The key of the `email_event` hashes (IP and recipient HMACs): the
+ * configured `ipSalt`, else the install's signing secret (configured or
+ * generated), else — only while neither exists — the public default salt.
+ */
+export function eventHashKey(): string {
+    if (!isDefaultIpSalt()) return cachedOptions.ipSalt as string;
+    return cachedOptions.signingSecret || DEFAULT_IP_SALT;
 }
 
 let signingSecretGenerated = false;

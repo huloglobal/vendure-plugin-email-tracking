@@ -1,6 +1,6 @@
 import { ChangeDetectorRef, Component, OnInit } from '@angular/core';
-import { HttpClient } from '@angular/common/http';
 import { SharedModule } from '@vendure/admin-ui/core';
+import { EmailTrackingHttp } from './activity-shared';
 
 interface WidgetData {
     tier: 'paid' | 'trial' | 'free';
@@ -12,7 +12,7 @@ interface WidgetData {
 /**
  * Dashboard widget: the last 7 days of Email Tracking at a glance
  * (Dashboard → Add widget → Email Tracking). Reads `GET /email-track/widget`
- * with the admin session, same as the Email Log page.
+ * with the admin session (and the bearer token on bearer-auth hosts), same as the Email Log page.
  */
 @Component({
     selector: 'hulo-email-tracking-widget',
@@ -51,7 +51,7 @@ export class EmailTrackingWidgetComponent implements OnInit {
     data: WidgetData | null = null;
     error = '';
 
-    constructor(private http: HttpClient, private cdr: ChangeDetectorRef) {}
+    constructor(private http: EmailTrackingHttp, private cdr: ChangeDetectorRef) {}
 
     ngOnInit() {
         this.http.get<WidgetData>('/email-track/widget').subscribe({

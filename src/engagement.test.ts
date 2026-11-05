@@ -60,6 +60,13 @@ describe('buildSetupItems', () => {
         expect(buildSetupItems({ hasRecentLog: true, publicBaseUrl: 'http://127.0.0.1/', bounceSecretConfigured: true, hasEngagement: true }).items[1].done).toBe(false);
     });
 
+    it('counts a configured provider webhook as the bounce feed', () => {
+        const list = buildSetupItems({ hasRecentLog: true, publicBaseUrl: 'https://s.example', bounceSecretConfigured: false, providerWebhooksConfigured: true, hasEngagement: true });
+        expect(list.items[2]).toMatchObject({ key: 'bounceWebhook', done: true });
+        expect(list.items[2].hint).toContain('/email-track/webhook/:provider');
+        expect(buildSetupItems({ hasRecentLog: true, publicBaseUrl: 'https://s.example', bounceSecretConfigured: false, hasEngagement: true }).items[2].done).toBe(false);
+    });
+
     it('turns the undone items into at most three digest tips, in order', () => {
         const list = buildSetupItems({ hasRecentLog: false, publicBaseUrl: '', bounceSecretConfigured: false, hasEngagement: false });
         const tips = tipsFromChecklist(list, 'https://shop.example.com/admin/extensions/email-log');
@@ -72,7 +79,10 @@ describe('buildSetupItems', () => {
 });
 
 describe('PREMIUM_FEATURES', () => {
-    it('lists the four paid capabilities', () => {
-        expect(PREMIUM_FEATURES).toEqual(['Open and click tracking', 'Per-template open and click rates', 'CSV export', 'Suppression list']);
+    it('lists the paid capabilities', () => {
+        expect(PREMIUM_FEATURES).toEqual([
+            'Open and click tracking', 'Per-template open and click rates', 'CSV export', 'Suppression list',
+            'Order email activity and evidence report', 'Provider delivery, deferral and unsubscribe events',
+        ]);
     });
 });

@@ -1,6 +1,6 @@
-import { Injectable, OnApplicationBootstrap, OnModuleDestroy } from '@nestjs/common';
+import { Injectable, OnApplicationBootstrap, OnModuleDestroy, Optional } from '@nestjs/common';
 import {
-    hashIp, isLicensed, signValue, adapterFor, DbAdapter,
+    hashIp, adapterFor, DbAdapter,
     PluginPrefs, WeeklyDigest, WeeklyDigestSettings, DigestStat, DigestTip, DigestMail, DigestInput,
     smtpTransportFromEnv, describeLicence, licenceLifecycleNotice, formatStat, composeDigest,
 } from '@huloglobal/vendure-licence-sdk';
@@ -9,10 +9,12 @@ import * as nodemailer from 'nodemailer';
 import { EmailLog, EmailLogStatus } from './email-log.entity';
 import { EmailSuppression } from './email-suppression.entity';
 import { lookupGeo } from './geo-lookup';
-import { getLicenceStatus, getOptions, ownTrackingPrefixes, trackingBaseUrl, hasPremiumAccess, getEvalState, configuredSigningSecret, setStatsProvider } from './options';
+import { getLicenceStatus, getOptions, hasPremiumAccess, getEvalState, configuredSigningSecret, setStatsProvider } from './options';
 import { parseEmailClient } from './parse-ua';
-import { decodeHtmlHref } from './decode-html-href';
-import { trackedClickHref } from './click-signature';
+import { EmailEventService } from './email-event.service';
+import { correlationHeaders, mergeHeaders, providerMessageIdFromSmtpReply, sendPayload, wrapTrackedHtml } from './outgoing-mail';
+import { findLink, LinkMeta, redactSensitiveUrl } from './link-meta';
+import { dedupeKeyFor } from './webhook-mappers';
 
 const loggerCtx = 'EmailTrackingService';
 
@@ -27,7 +29,12 @@ export const PREMIUM_FEATURES = [
     'Per-template open and click rates',
     'CSV export',
     'Suppression list',
+    'Order email activity and evidence report',
+    'Provider delivery, deferral and unsubscribe events',
 ];
+
+/** SQLite family (tests, local dev): Date parameters are bound as UTC strings there. */
+const SQLITE_TYPES = new Set(['sqlite', 'sqljs', 'better-sqlite3', 'capacitor', 'cordova', 'expo', 'nativescript', 'react-native']);
 
 const DAY_MS = 86_400_000;
 
@@ -100,6 +107,8 @@ export interface SetupFacts {
     publicBaseUrl: string;
     /** `bounceWebhookSecret` or a *configured* `signingSecret`. */
     bounceSecretConfigured: boolean;
+    /** At least one provider webhook (0.16.0) is configured — bounces arrive that way too. */
+    providerWebhooksConfigured?: boolean;
     /** At least one open or click ever recorded. */
     hasEngagement: boolean;
 }
@@ -126,10 +135,12 @@ export function buildSetupItems(f: SetupFacts): SetupChecklist {
             url: DOCS_URL,
         },
         {
-            key: 'bounceWebhook', label: 'Bounce webhook secret configured', done: f.bounceSecretConfigured,
+            key: 'bounceWebhook', label: 'Bounce webhook secret configured', done: f.bounceSecretConfigured || !!f.providerWebhooksConfigured,
             hint: f.bounceSecretConfigured
                 ? 'Signed bounce and complaint webhooks are accepted at /email-track/bounce.'
-                : 'Set `bounceWebhookSecret` and point your mail provider\'s bounce webhook at /email-track/bounce — hard bounces and complaints then land on the suppression list automatically.',
+                : f.providerWebhooksConfigured
+                    ? 'Provider delivery webhooks are configured at /email-track/webhook/:provider — bounces and complaints reach the suppression list that way.'
+                    : 'Set `bounceWebhookSecret` and point your mail provider\'s bounce webhook at /email-track/bounce, or configure `providerWebhooks` (Postmark, SendGrid, Mailgun, Amazon SES) — hard bounces and complaints then land on the suppression list automatically.',
             url: DOCS_URL,
         },
         {
@@ -177,31 +188,38 @@ export const RETENTION_BATCH = 5000;
 /** Batches per sweep (1 000 000 rows); the next daily run continues. */
 const RETENTION_MAX_BATCHES = 200;
 
+/** The shortest `email_event` retention: provider webhooks accept a replay for up to 72 hours (SendGrid),
+ *  and a replay is a no-op only while its dedupe row exists. */
+export const EVENT_RETENTION_MIN_DAYS = 3;
+
 /**
  * Delete matching rows `RETENTION_BATCH` at a time, oldest id first, until
- * a batch comes back short. One unbounded `DELETE` on a large `email_log`
- * holds locks for the whole scan and stalls the sender; small batches with
- * a pause between them do not. The derived-table form is valid on
- * MariaDB/MySQL (which refuse `LIMIT` in a plain `IN` subquery) and on
- * Postgres (which has no `DELETE … ORDER BY … LIMIT`).
+ * no full batch is left. Each round selects the next batch's ids and deletes
+ * the matching rows up to the last of them, so the count comes from the rows
+ * selected — never from the driver's affected-rows figure, which TypeORM
+ * reports as 2 for every DELETE on PostgreSQL. One unbounded `DELETE` on a
+ * large `email_log` holds locks for the whole scan and stalls the sender;
+ * small batches with a pause between them do not.
  */
 export async function batchedDelete(
     db: Pick<DbAdapter, 'query'>,
-    table: 'email_log' | 'email_link',
+    table: 'email_log' | 'email_link' | 'email_event',
     where: string,
     params: any[],
     pauseMs = 50,
 ): Promise<number> {
     let total = 0;
     for (let i = 0; i < RETENTION_MAX_BATCHES; i++) {
-        const res = await db.query(
-            `DELETE FROM ${table} WHERE id IN (SELECT id FROM (SELECT id FROM ${table} WHERE ${where} ORDER BY id ASC LIMIT ${RETENTION_BATCH}) AS batch)`,
+        const rows = await db.query(
+            `SELECT id FROM ${table} WHERE ${where} ORDER BY id ASC LIMIT ${RETENTION_BATCH}`,
             params,
-            { needAffected: true },
         );
-        const n = Number(res?.affectedRows ?? 0);
-        total += n;
-        if (n < RETENTION_BATCH) break;
+        const ids = (Array.isArray(rows) ? rows : []).map((r: any) => Number(r?.id)).filter(n => Number.isFinite(n));
+        if (!ids.length) break;
+        const last = Math.max(...ids);
+        await db.query(`DELETE FROM ${table} WHERE id <= ? AND (${where})`, [last, ...params], { needAffected: true });
+        total += ids.length;
+        if (ids.length < RETENTION_BATCH) break;
         if (pauseMs > 0) await new Promise(r => setTimeout(r, pauseMs));
     }
     return total;
@@ -216,7 +234,18 @@ export class EmailTrackingService implements OnApplicationBootstrap, OnModuleDes
     /** Monday 08:00 (server-local) "what Email Tracking did for you" report. */
     readonly digest: WeeklyDigest;
 
-    constructor(private connection: TransactionalConnection, private processContext: ProcessContext) {
+    /** Writes the `email_event` timeline. */
+    private readonly events: EmailEventService;
+
+    constructor(
+        private connection: TransactionalConnection,
+        private processContext: ProcessContext,
+        // Optional: a host plugin that lists EmailTrackingService in its own `providers` (as 0.15.x
+        // allowed) gets an instance in a module without EmailEventService; it then writes the same
+        // table through one of its own instead of failing the host's boot.
+        @Optional() events?: EmailEventService,
+    ) {
+        this.events = events ?? new EmailEventService(connection);
         const query = (sql: string, params?: any[], o?: any) => adapterFor(this.connection.rawConnection).query(sql, params, o);
         this.prefs = new PluginPrefs(query, PLUGIN_SHORT_ID);
         this.digest = new WeeklyDigest({
@@ -312,6 +341,11 @@ export class EmailTrackingService implements OnApplicationBootstrap, OnModuleDes
             hasRecentLog,
             publicBaseUrl: opts.publicBaseUrl,
             bounceSecretConfigured: !!(opts.bounceWebhookSecret || configuredSigningSecret()),
+            providerWebhooksConfigured: !!(opts.providerWebhooks && (
+                (opts.providerWebhooks.postmark?.username && opts.providerWebhooks.postmark?.password)
+                || opts.providerWebhooks.sendgrid?.verificationKey
+                || opts.providerWebhooks.mailgun?.signingKey
+                || opts.providerWebhooks.ses?.topicArns?.length)),
             hasEngagement,
         });
     }
@@ -386,29 +420,48 @@ export class EmailTrackingService implements OnApplicationBootstrap, OnModuleDes
     digestSettings(): Promise<WeeklyDigestSettings> { return this.digest.settings(); }
 
     /** One retention pass: `email_log` older than `days` (and beyond `maxRows`),
-     *  `email_link` rows past `expiresAt` or older than `days`. */
-    async sweepRetention(): Promise<{ logs: number; links: number }> {
+     *  `email_link` rows past `expiresAt` or older than `days`, and
+     *  `email_event` rows older than `days` (at least 3), belonging to emails
+     *  `maxRows` pruned, or — under `maxRows` — unlinked (no email) and older
+     *  than the oldest email kept. */
+    async sweepRetention(): Promise<{ logs: number; links: number; events: number }> {
         const r = getOptions().retention;
         const db = adapterFor(this.connection.rawConnection);
-        const out = { logs: 0, links: 0 };
+        const out = { logs: 0, links: 0, events: 0 };
         if (!r) return out;
         try {
             if (r.days && r.days > 0) {
                 out.logs += await batchedDelete(db, 'email_log', '`createdAt` < DATE_SUB(NOW(), INTERVAL ? DAY)', [r.days]);
                 out.links += await batchedDelete(db, 'email_link', '`createdAt` < DATE_SUB(NOW(), INTERVAL ? DAY)', [r.days]);
             }
+            let cutoff = 0;
             if (r.maxRows && r.maxRows > 0) {
                 const rows = await db.query('SELECT COUNT(*) AS n FROM email_log');
                 const over = Number(rows?.[0]?.n ?? 0) - r.maxRows;
                 if (over > 0) {
                     // Oldest ids first; the cutoff id keeps every batch bounded.
                     const edge = await db.query('SELECT id FROM email_log ORDER BY id ASC LIMIT 1 OFFSET ?', [over]);
-                    const cutoff = Number(edge?.[0]?.id ?? 0);
+                    cutoff = Number(edge?.[0]?.id ?? 0);
                     if (cutoff > 0) out.logs += await batchedDelete(db, 'email_log', 'id < ?', [cutoff]);
                 }
             }
             out.links += await batchedDelete(db, 'email_link', '`expiresAt` IS NOT NULL AND `expiresAt` < NOW()', []);
-            if (out.logs || out.links) Logger.info(`retention: pruned ${out.logs} email_log and ${out.links} email_link row(s)`, loggerCtx);
+            // The event timeline: its own failure (e.g. the table is not migrated yet) never stops the rest.
+            try {
+                if (r.days && r.days > 0) {
+                    out.events += await batchedDelete(db, 'email_event', '`createdAt` < DATE_SUB(NOW(), INTERVAL ? DAY)', [Math.max(r.days, EVENT_RETENTION_MIN_DAYS)]);
+                }
+                if (cutoff > 0) {
+                    out.events += await batchedDelete(db, 'email_event', '`emailLogId` < ?', [cutoff]);
+                    // Unlinked events (admin suppressions, unmatched provider events) go with the emails of their time.
+                    const oldest = await db.query('SELECT `createdAt` FROM email_log ORDER BY id ASC LIMIT 1');
+                    const keptFrom = oldest?.[0]?.createdAt;
+                    if (keptFrom) out.events += await batchedDelete(db, 'email_event', '`emailLogId` IS NULL AND `createdAt` < ?', [keptFrom]);
+                }
+            } catch (e: any) {
+                Logger.warn(`retention: email_event not pruned: ${e?.message}`, loggerCtx);
+            }
+            if (out.logs || out.links || out.events) Logger.info(`retention: pruned ${out.logs} email_log, ${out.links} email_link and ${out.events} email_event row(s)`, loggerCtx);
         } catch (e: any) {
             Logger.warn(`retention sweep failed: ${e?.message}`, loggerCtx);
         }
@@ -447,7 +500,12 @@ export class EmailTrackingService implements OnApplicationBootstrap, OnModuleDes
                 status: 'suppressed' as EmailLogStatus, tracked: true,
                 errorMessage: 'Recipient is on the suppression list',
             });
-            return await repo.save(suppressed);
+            const row = await repo.save(suppressed);
+            await this.events.record({
+                type: 'suppressed', source: 'smtp', log: this.linkOf(row), recipient,
+                detail: 'Not sent: the recipient is on the suppression list',
+            });
+            return row;
         }
 
         // Create the row up-front so the pixel/click URLs have an id to
@@ -477,69 +535,99 @@ export class EmailTrackingService implements OnApplicationBootstrap, OnModuleDes
         // nodemailer also accepts Buffer/stream/{path} bodies: only wrap a string.
         const html = typeof mail.html === 'string' ? mail.html : '';
         if (mail.html && !html) Logger.warn('tracked send: non-string html body left untouched (no tracking)', loggerCtx);
+        let links: LinkMeta[] = [];
+        let signed: boolean | null = null;
         if (html) {
-            const wrapped = this.wrapHtml(html, Number(saved.id));
-            mail = { ...mail, html: wrapped };
+            const wrapped = wrapTrackedHtml(html, Number(saved.id));
+            links = wrapped.links;
+            signed = wrapped.signed;
+            mail = { ...mail, html: wrapped.html };
         }
+        // The configured providers echo this id back in their webhook events.
+        const corr = correlationHeaders(Number(saved.id));
+        if (Object.keys(corr).length) mail = { ...mail, headers: mergeHeaders(mail.headers, corr) };
 
         // Send.
+        let info: any;
         try {
-            const info = await transporter.sendMail(mail);
-            saved.smtpResponse = String(info.response || '').slice(0, 500);
-            // Stored without angle brackets; the bounce matcher accepts both forms.
-            saved.smtpMessageId = String(info.messageId || '').replace(/^<|>$/g, '').slice(0, 500);
-            // Gmail's "250 2.0.0 OK" → sent. 4xx → deferred. 5xx → failed.
-            const code = parseInt((info.response || '').split(' ')[0], 10);
-            if (code >= 500) saved.status = 'failed';
-            else if (code >= 400) saved.status = 'deferred';
-            else saved.status = 'sent';
-            await repo.save(saved);
+            info = await transporter.sendMail(mail);
         } catch (e: any) {
-            saved.status = 'failed';
             saved.errorMessage = String(e?.message || e).slice(0, 2000);
             saved.smtpResponse = e?.response ? String(e.response).slice(0, 500) : '';
-            await repo.save(saved);
+            await repo.update(saved.id, { errorMessage: saved.errorMessage, smtpResponse: saved.smtpResponse });
+            saved.status = await this.settleSendStatus(Number(saved.id), 'failed');
+            await this.events.record({
+                type: 'failed', source: 'smtp', log: this.linkOf(saved), recipient,
+                detail: [saved.smtpResponse, saved.errorMessage].filter(Boolean).join(' — ') || null,
+                payload: signed === null ? null : sendPayload([], signed),
+            });
             Logger.error(`Tracked send FAILED [${meta.type}] to ${saved.recipient}: ${e?.message}`, loggerCtx);
             throw e;
         }
+        saved.smtpResponse = String(info?.response || '').slice(0, 500);
+        // Stored without angle brackets; the bounce matcher accepts both forms.
+        saved.smtpMessageId = String(info?.messageId || '').replace(/^<|>$/g, '').slice(0, 500);
+        // Gmail's "250 2.0.0 OK" → sent. 4xx → deferred. 5xx → failed.
+        const code = parseInt((info?.response || '').split(' ')[0], 10);
+        const outcome: EmailLogStatus = code >= 500 ? 'failed' : code >= 400 ? 'deferred' : 'sent';
+        await repo.update(saved.id, { smtpResponse: saved.smtpResponse, smtpMessageId: saved.smtpMessageId });
+        saved.status = await this.settleSendStatus(Number(saved.id), outcome);
+        await this.events.record({
+            type: outcome === 'failed' ? 'failed' : outcome === 'deferred' ? 'deferred' : 'sent',
+            source: 'smtp', log: this.linkOf(saved), recipient,
+            messageId: saved.smtpMessageId || null,
+            providerMessageId: providerMessageIdFromSmtpReply(saved.smtpResponse),
+            detail: saved.smtpResponse || null,
+            payload: signed === null ? null : sendPayload(links, signed),
+        });
         Logger.info(`Tracked send OK [${meta.type}] to ${saved.recipient} (id=${saved.id})`, loggerCtx);
         return saved;
     }
 
-    /** Wrap an HTML body for tracking: rewrite links + append open pixel. */
-    wrapHtml(html: string, eventId: number): string {
-        const base = trackingBaseUrl();
-        const token = this.tokenForId(eventId);
-        const trackedHtml = this.rewriteLinks(html, token, base);
-        const pixel = `<img src="${base}/email-track/open/${token}.gif" width="1" height="1" alt="" border="0" style="border:0;width:1px;height:1px;opacity:0;overflow:hidden">`;
-        if (/<\/body>/i.test(trackedHtml)) {
-            return trackedHtml.replace(/<\/body>/i, `${pixel}</body>`);
+    /**
+     * The status after the SMTP reply: `outcome` replaces only the optimistic
+     * `sent` the row was created with (one guarded UPDATE), so a provider
+     * event that arrived between the provider's reply and this write — a
+     * bounce, a complaint, a delivery — is never overwritten. Returns the
+     * status the row has now.
+     */
+    async settleSendStatus(emailLogId: number, outcome: EmailLogStatus): Promise<EmailLogStatus> {
+        if (outcome !== 'sent') {
+            await adapterFor(this.connection.rawConnection).query(
+                "UPDATE email_log SET status = ? WHERE id = ? AND status = 'sent'",
+                [outcome, emailLogId], { needAffected: true },
+            );
         }
-        return trackedHtml + pixel;
+        try {
+            const row = await this.connection.rawConnection.getRepository(EmailLog).findOne({ where: { id: emailLogId }, select: ['id', 'status'] as any });
+            return (row?.status as EmailLogStatus) || outcome;
+        } catch {
+            return outcome;
+        }
     }
 
-    /** Build the URL path token for an email-log id. When a
-     *  `signingSecret` is configured, the token is `<id>.<hmac>` so the
-     *  controller can verify nobody forged a URL. Without a secret we
-     *  fall back to the bare id (legacy behaviour). */
-    private tokenForId(eventId: number): string {
-        const secret = getOptions().signingSecret;
-        if (secret) return signValue(String(eventId), secret);
-        return String(eventId);
+    /** Wrap an HTML body for tracking: rewrite links + append open pixel.
+     *  When a `signingSecret` is set (configured or generated) the token is
+     *  `<id>.<hmac>` so nobody can forge a URL; otherwise the bare id. */
+    wrapHtml(html: string, eventId: number): string {
+        return wrapTrackedHtml(html, eventId).html;
     }
 
-    private rewriteLinks(html: string, token: string, base: string): string {
-        const ownPrefixes = ownTrackingPrefixes();
-        return html.replace(/<a\b([^>]*?)\bhref\s*=\s*(["'])(.*?)\2/gi, (match, attrs, quote, url) => {
-            const trimmed = String(url).trim();
-            if (!trimmed) return match;
-            if (/^(mailto:|tel:|#)/i.test(trimmed)) return match;
-            if (ownPrefixes.some(p => trimmed.startsWith(p))) return match;
-            if (/unsubscribe/i.test(trimmed) || /\bopt[-_]?out\b/i.test(trimmed)) return match;
-            // Decode HTML-escaped query separators before encoding the target.
-            const target = decodeHtmlHref(trimmed).trim();
-            return `<a${attrs}href=${quote}${trackedClickHref(base, token, target, getOptions().signingSecret)}${quote}`;
-        });
+    /** The email_log columns an event copies. */
+    private linkOf(row: Pick<EmailLog, 'id' | 'orderId' | 'customerId' | 'channelId'>) {
+        return {
+            id: Number(row.id),
+            orderId: row.orderId ?? null,
+            customerId: row.customerId ?? null,
+            channelId: row.channelId ?? null,
+        };
+    }
+
+    /** Date parameter for raw SQL: sqlite drivers cannot bind a Date object. */
+    private sqlDate(d: Date): Date | string {
+        return SQLITE_TYPES.has(String((this.connection.rawConnection.options as any)?.type || ''))
+            ? d.toISOString().replace('T', ' ').replace('Z', '')
+            : d;
     }
 
     /** Record a pixel-hit open. Idempotent re-counting; firstOpenedAt only
@@ -552,26 +640,42 @@ export class EmailTrackingService implements OnApplicationBootstrap, OnModuleDes
      *    - ipHash    one-way hash with the per-install salt
      *    - ua / client / platform / isBot   from parseEmailClient
      *    - country / region / city / timezone   best-effort MaxMind geo
+     *
+     *  A bare (unsigned) id while a signing secret exists is recorded as an
+     *  `unverified` event only: anyone can produce one, so it never touches
+     *  the `email_log` counters, first-open fields or history (see
+     *  `isEventOnlyHit`).
      */
-    async recordOpen(id: number, ip: string | null, ua: string | null) {
+    async recordOpen(id: number, ip: string | null, ua: string | null, how: { signed?: boolean } = {}) {
         const repo = this.connection.rawConnection.getRepository(EmailLog);
         const opts = getOptions();
         const now = new Date();
+        const unsigned = how.signed === false;
+        if (unsigned && await this.isForgedUnsignedHit(id)) return;
         // Geo lookup uses the raw IP — done before hashing so we can
         // resolve country/city even when the stored IP is anonymised.
         const geo = await lookupGeo(ip);
+        if (unsigned && this.isEventOnlyHit()) {
+            const row = await repo.findOne({ where: { id }, select: ['id', 'orderId', 'customerId', 'channelId'] as any });
+            if (row) await this.events.recordEngagement({ type: 'open', source: 'pixel', occurredAt: now, log: this.linkOf(row), ip, geo, userAgent: ua, unsigned });
+            return;
+        }
         const ipForRow = opts.hashIpsInHistory ? hashIp(ip, opts.ipSalt || '') : ip;
         // Atomic counter: Gmail's proxy, Apple MPP and the real open arrive together.
         const r = await adapterFor(this.connection.rawConnection).query(
             `UPDATE email_log SET \`openCount\` = \`openCount\` + 1, \`lastOpenedAt\` = ?,
                     \`firstOpenedAt\` = COALESCE(\`firstOpenedAt\`, ?), \`firstOpenIp\` = COALESCE(\`firstOpenIp\`, ?), \`firstOpenUserAgent\` = COALESCE(\`firstOpenUserAgent\`, ?)
               WHERE id = ?`,
-            [now, now, ipForRow || null, ua ? ua.slice(0, 1000) : null, id], { needAffected: true },
+            [this.sqlDate(now), this.sqlDate(now), ipForRow || null, ua ? ua.slice(0, 1000) : null, id], { needAffected: true },
         );
-        if (!Number(r?.affectedRows ?? r?.rowCount ?? 0)) return;
+        // MySQL / Postgres report the affected rows; sqlite does not (the lookup below decides).
+        const affected = r?.affectedRows ?? r?.rowCount;
+        if (affected !== undefined && !Number(affected)) return;
         // History is best effort (last writer wins on the JSON only).
         const row = await repo.findOne({ where: { id } });
         if (!row) return;
+        // The raw event (never deduplicated; capped per email per day), classified; enrichment follows asynchronously.
+        await this.events.recordEngagement({ type: 'open', source: 'pixel', occurredAt: now, log: this.linkOf(row), ip, geo, userAgent: ua, unsigned });
         let opens: any[] = [];
         try { opens = JSON.parse(row.opensJson || '[]'); } catch {}
         const parsed = parseEmailClient(ua);
@@ -592,26 +696,53 @@ export class EmailTrackingService implements OnApplicationBootstrap, OnModuleDes
         await repo.update(id, { opensJson: JSON.stringify(opens) });
     }
 
-    /** Record a click. Geo + IP hashing applied the same way as opens. */
-    async recordClick(id: number, url: string, ip: string | null, ua: string | null): Promise<string | null> {
+    /** Record a click. Geo + IP hashing applied the same way as opens.
+     *  The recorded URL (event and `clicksJson`) has token-like query
+     *  parameters redacted; the redirect itself still uses the real URL.
+     *  `link` is the per-link metadata when the caller has it (EmailLink
+     *  tokens); for wrapped mail it is looked up from the send event.
+     *  A bare (unsigned) id while a signing secret exists is an `unverified`
+     *  event only, as for opens. */
+    async recordClick(id: number, url: string, ip: string | null, ua: string | null, link?: { linkIndex?: number | null; linkText?: string | null }, how: { signed?: boolean } = {}): Promise<string | null> {
         const repo = this.connection.rawConnection.getRepository(EmailLog);
         const opts = getOptions();
         const now = new Date();
-        const r = await adapterFor(this.connection.rawConnection).query(
-            `UPDATE email_log SET \`clickCount\` = \`clickCount\` + 1, \`firstClickedAt\` = COALESCE(\`firstClickedAt\`, ?) WHERE id = ?`,
-            [now, id], { needAffected: true },
-        );
-        if (!Number(r?.affectedRows ?? r?.rowCount ?? 0)) return null;
-        const row = await repo.findOne({ where: { id } });
+        const unsigned = how.signed === false;
+        if (unsigned && await this.isForgedUnsignedHit(id)) return null;
+        const eventOnly = unsigned && this.isEventOnlyHit();
+        let row: EmailLog | null;
+        if (eventOnly) {
+            row = await repo.findOne({ where: { id }, select: ['id', 'orderId', 'customerId', 'channelId'] as any });
+        } else {
+            const r = await adapterFor(this.connection.rawConnection).query(
+                `UPDATE email_log SET \`clickCount\` = \`clickCount\` + 1, \`firstClickedAt\` = COALESCE(\`firstClickedAt\`, ?) WHERE id = ?`,
+                [this.sqlDate(now), id], { needAffected: true },
+            );
+            const affected = r?.affectedRows ?? r?.rowCount;
+            if (affected !== undefined && !Number(affected)) return null;
+            row = await repo.findOne({ where: { id } });
+        }
         if (!row) return null;
 
-        const geo = await lookupGeo(ip);
+        const [geo, links] = await Promise.all([
+            lookupGeo(ip),
+            link ? Promise.resolve(null) : this.events.linksFor(id),
+        ]);
         const ipForRow = opts.hashIpsInHistory ? hashIp(ip, opts.ipSalt || '') : ip;
+        const found = link ? null : findLink(links, url, opts.signingSecret);
+        const recorded = redactSensitiveUrl(url);
+        await this.events.recordEngagement({
+            type: 'click', source: 'redirect', occurredAt: now, log: this.linkOf(row), ip, geo, userAgent: ua, url: recorded,
+            linkIndex: link ? (link.linkIndex ?? null) : (found ? found.i : null),
+            linkText: link ? (link.linkText ?? null) : (found ? found.t : null),
+            unsigned,
+        });
+        if (eventOnly) return url;
 
         let clicks: any[] = [];
         try { clicks = JSON.parse(row.clicksJson || '[]'); } catch {}
         clicks.push({
-            url: url.slice(0, 1000),
+            url: recorded.slice(0, 1000),
             ts: now.toISOString(),
             ip: ipForRow,
             ipHash: hashIp(ip, opts.ipSalt || ''),
@@ -626,6 +757,32 @@ export class EmailTrackingService implements OnApplicationBootstrap, OnModuleDes
         return url;
     }
 
+    /**
+     * A pixel / click on the bare (unsigned) id of an email whose own links
+     * were signed: nobody received that URL from us, so it is forged and is
+     * not recorded at all. Bare ids of every other email — no 0.16.0 send
+     * event saying its links were signed: sent before 0.16.0 (signed or
+     * not), or while no secret existed — are recorded with the
+     * `unsigned-token` reason (`isEventOnlyHit` says where).
+     */
+    private async isForgedUnsignedHit(id: number): Promise<boolean> {
+        if (!getOptions().signingSecret) return false;
+        return (await this.events.sendInfo(id))?.signed === true;
+    }
+
+    /**
+     * True while a signing secret exists (configured or generated): a bare
+     * id is then recorded as an `unverified` event only — never counted in
+     * `email_log` (openCount / clickCount, firstOpenedAt / firstClickedAt,
+     * the JSON history), so enumerating ids cannot move the figures the
+     * Email Log, the order summary and the evidence report show. Without any
+     * secret every link is a bare id and is counted as in 0.15.4 (still
+     * flagged `unverified` on its event).
+     */
+    private isEventOnlyHit(): boolean {
+        return !!getOptions().signingSecret;
+    }
+
     /** SMTP DSN (bounce / complaint) hook — wire up if you point Postmaster
      *  Tools / a bounce-processor at /email-track/bounce. Hard bounces +
      *  complaints automatically add the recipient to the suppression list
@@ -636,9 +793,16 @@ export class EmailTrackingService implements OnApplicationBootstrap, OnModuleDes
         const bare = messageId.replace(/^<|>$/g, '');
         const row = (await repo.findOne({ where: { smtpMessageId: bare } })) || (await repo.findOne({ where: { smtpMessageId: `<${bare}>` } }));
         if (!row) return false;
-        row.status = opts.soft ? 'deferred' : status;
-        if (reason) row.errorMessage = reason.slice(0, 2000);
-        await repo.save(row);
+        // Status precedence (event-types.ts): a soft bounce never overwrites a
+        // delivered/bounced/complained email, a bounce never a complaint.
+        await this.events.applyStatus(Number(row.id), opts.soft ? 'deferred' : status, reason || null);
+        const type = opts.soft ? 'soft-bounce' : status === 'complained' ? 'complained' : 'bounced';
+        await this.events.record({
+            type, source: 'bounce-webhook', log: this.linkOf(row), recipient: row.recipient, messageId: bare,
+            // A retried webhook carries the same facts: one row.
+            dedupeKey: dedupeKeyFor('bounce-webhook', `${bare}|${type}|${reason || ''}`),
+            detail: reason || null,
+        });
         if (opts.soft) return true; // mailbox full / greylisted: never suppress
 
         if (row.recipient) {
@@ -679,6 +843,15 @@ export class EmailTrackingService implements OnApplicationBootstrap, OnModuleDes
         ).catch(() => undefined);
         const row = await repo.findOne({ where: { recipient: lower } });
         return row || (await repo.save(repo.create({ recipient: lower, reason, note: note ? note.slice(0, 2000) : (null as any), channelId: channelId || null as any })));
+    }
+
+    /** A manual suppression on the event timeline (source `admin`). Best-effort. */
+    async recordAdminSuppression(recipient: string, reason: string, userId: string | null, channelId: number | null): Promise<void> {
+        await this.events.record({
+            type: 'suppressed', source: 'admin', recipient, channelId,
+            detail: `Added to the suppression list by an administrator (reason: ${String(reason).slice(0, 32)})`,
+            payload: userId ? { by: `user #${userId}` } : null,
+        });
     }
 
     async removeSuppression(recipient: string): Promise<boolean> {

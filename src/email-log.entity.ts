@@ -5,6 +5,7 @@ export type EmailLogStatus =
     | 'sent'        // SMTP accepted (250)
     | 'failed'      // SMTP rejected at submit-time (4xx/5xx) or threw
     | 'deferred'    // Temporary failure (4xx)
+    | 'delivered'   // A provider webhook reported delivery to the receiving server (0.16.0)
     | 'bounced'     // Permanent failure (later)
     | 'complained'  // Recipient marked as spam (later)
     | 'suppressed'; // Refused at send-time because the recipient is on the suppression list

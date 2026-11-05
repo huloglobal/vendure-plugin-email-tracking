@@ -7,15 +7,25 @@
  *
  * The scratch database gets TypeORM-quoted stand-ins for `email_log`,
  * `email_link`, `email_suppression`, `customer`, `order`,
- * `order_channels_channel` and `channel`, plus the SDK's `hulo_licence_store`. Each statement
+ * `order_channels_channel` and `channel`, the exact DDL TypeORM generates
+ * for `email_event` (0.16.0), plus the SDK's `hulo_licence_store`. Each statement
  * runs inside a rolled-back transaction, so the seed rows survive and the
  * run is idempotent. SELECTs must return rows with their camelCase aliases
  * intact (the adapter restores them from PG's lower-cased identifiers).
  */
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import { createDbAdapter, translateSql } from '@huloglobal/vendure-licence-sdk';
+
+// The composed retention deletes come from batchedDelete; entities need decorator metadata the transform lacks.
+vi.mock('./email-log.entity', () => ({ EmailLog: class EmailLog {} }));
+vi.mock('./email-suppression.entity', () => ({ EmailSuppression: class EmailSuppression {} }));
+vi.mock('./email-event.entity', () => ({ EmailEvent: class EmailEvent {} }));
+import { batchedDelete } from './email-tracking.service';
+import { EmailEventService } from './email-event.service';
+import { applyStatusChange, nextStatus, STATUS_RANK, statusChangeForEvent } from './event-types';
+import { databaseClockSkewMinutes } from './db-clock';
 
 const PG_URL = process.env.HULO_PG_URL;
 
@@ -28,6 +38,14 @@ const DDL = [
     `DROP TABLE IF EXISTS order_channels_channel`,
     `DROP TABLE IF EXISTS channel`,
     `DROP TABLE IF EXISTS hulo_licence_store`,
+    `DROP TABLE IF EXISTS email_event`,
+    // Exactly what TypeORM generates for EmailEvent on PostgreSQL (README → Upgrading to 0.16.0).
+    `CREATE TABLE "email_event" ("createdAt" TIMESTAMP NOT NULL DEFAULT now(), "updatedAt" TIMESTAMP NOT NULL DEFAULT now(), "emailLogId" integer, "orderId" integer, "customerId" integer, "channelId" integer, "type" character varying(32) NOT NULL, "source" character varying(32) NOT NULL, "occurredAt" TIMESTAMP(3) NOT NULL, "messageId" character varying(255), "providerMessageId" character varying(255), "dedupeKey" character varying(64), "recipientHash" character varying(64), "ip" character varying(64), "ipHash" character varying(64), "country" character varying(8), "region" character varying(64), "city" character varying(128), "timezone" character varying(64), "asn" character varying(16), "org" character varying(255), "isProxy" boolean, "isVpn" boolean, "isTor" boolean, "isHosting" boolean, "isMobile" boolean, "enrichedBy" character varying(32), "enrichedAt" TIMESTAMP(3), "userAgent" text, "client" character varying(64), "platform" character varying(32), "isBot" boolean, "classification" character varying(16), "classificationReasons" character varying(255), "url" text, "linkIndex" integer, "linkText" character varying(128), "detail" text, "payload" text, "id" SERIAL NOT NULL, CONSTRAINT "PK_6620d7d3a9919b2ca7b12ba423e" PRIMARY KEY ("id"))`,
+    `CREATE UNIQUE INDEX "UQ_email_event_dedupe" ON "email_event" ("dedupeKey")`,
+    `CREATE INDEX "IDX_email_event_created" ON "email_event" ("createdAt")`,
+    `CREATE INDEX "IDX_email_event_provider_message" ON "email_event" ("providerMessageId")`,
+    `CREATE INDEX "IDX_email_event_log" ON "email_event" ("emailLogId", "occurredAt")`,
+    `CREATE INDEX "IDX_email_event_order" ON "email_event" ("orderId", "occurredAt")`,
     `CREATE TABLE email_log (
         id SERIAL PRIMARY KEY,
         "createdAt" TIMESTAMP NOT NULL DEFAULT NOW(),
@@ -134,6 +152,11 @@ const SEED = [
     `INSERT INTO order_channels_channel ("orderId", "channelId") VALUES (1, 1), (1, 2)`,
     `INSERT INTO channel (code, token) VALUES ('__default_channel__', '1'), ('second', '2')`,
     `INSERT INTO hulo_licence_store (pluginid, licencekey) VALUES ('vendure-plugin-email-tracking:signing-secret', 'secret')`,
+    `INSERT INTO email_event ("emailLogId", "orderId", "customerId", "channelId", type, source, "occurredAt", "messageId", "providerMessageId", "dedupeKey")
+     VALUES (1, 1, 1, 1, 'sent', 'smtp', NOW() - INTERVAL '2 hours', 'msg-1@example.com', 'queue-1', NULL),
+            (1, 1, 1, 1, 'open', 'pixel', NOW() - INTERVAL '1 hour', NULL, NULL, NULL),
+            (1, 1, 1, 1, 'bounced', 'sendgrid', NOW(), 'msg-1@example.com', NULL, REPEAT('d', 64))`,
+    `UPDATE email_event SET classification = 'machine_likely', "classificationReasons" = 'gmail-proxy' WHERE type = 'open'`,
 ];
 
 /** Stand-in for a `${expr}` interpolation inside an SQL template literal. */
@@ -143,12 +166,48 @@ function standIn(expr: string): string {
     if (/^where$/.test(e)) return '`createdAt` < DATE_SUB(NOW(), INTERVAL ? DAY)';
     if (/^table$/.test(e)) return 'email_log';
     if (/RETENTION_BATCH/.test(e)) return '5000';
+    if (/^marks$/.test(e)) return '?, ?, ?, ?, ?';
     if (/channelId/.test(e)) return ' AND `channelId` = ?';
     throw new Error(`pg-corpus: no stand-in for interpolation \${${e}} — add one to standIn()`);
 }
 
+/** Split a VALUES list on top-level commas (NOW() and friends keep their parentheses). */
+function splitTopLevel(list: string): string[] {
+    const out: string[] = [];
+    let depth = 0; let cur = ''; let inSingle = false;
+    for (const ch of list) {
+        if (ch === "'") inSingle = !inSingle;
+        if (!inSingle && ch === '(') depth++;
+        if (!inSingle && ch === ')') depth--;
+        if (!inSingle && depth === 0 && ch === ',') { out.push(cur); cur = ''; continue; }
+        cur += ch;
+    }
+    if (cur.trim()) out.push(cur);
+    return out.map(v => v.trim());
+}
+
+/** A value of the column's type for each `?` of an INSERT … (cols) VALUES (…); null when not that shape. */
+function insertParams(sql: string): any[] | null {
+    const m = /^INSERT\s+(?:IGNORE\s+)?INTO\s+\S+\s*\(([^)]*)\)\s*VALUES\s*\(([\s\S]*)\)\s*$/i.exec(sql.trim());
+    if (!m) return null;
+    const cols = m[1].split(',').map(c => c.trim().replace(/[`"]/g, ''));
+    const vals = splitTopLevel(m[2]);
+    if (cols.length !== vals.length) throw new Error(`pg-corpus: ${cols.length} columns but ${vals.length} values in ${sql}`);
+    const out: any[] = [];
+    cols.forEach((c, i) => {
+        if (vals[i] !== '?') return;
+        if (/At$/.test(c)) out.push(new Date());
+        else if (/^is[A-Z]/.test(c)) out.push(true);
+        else if (/(Id|Index|Count)$/.test(c)) out.push(1);
+        else out.push('x');
+    });
+    return out;
+}
+
 /** Bind a plausible value for each `?`, judged from the SQL just before it. */
 function paramsFor(sql: string): any[] {
+    const fromInsert = insertParams(sql);
+    if (fromInsert) return fromInsert;
     const out: any[] = [];
     let inSingle = false;
     for (let i = 0; i < sql.length; i++) {
@@ -264,8 +323,8 @@ describe.skipIf(!PG_URL)('Postgres SQL corpus (HULO_PG_URL)', () => {
 
     afterAll(async () => { await client.end(); });
 
-    it('finds the statements', () => {
-        expect(corpus.length).toBeGreaterThanOrEqual(14);
+    it(`finds the statements (${corpus.length})`, () => {
+        expect(corpus.length).toBeGreaterThanOrEqual(18);
     });
 
     it('leaves no MySQL-ism behind after translation', () => {
@@ -301,5 +360,125 @@ describe.skipIf(!PG_URL)('Postgres SQL corpus (HULO_PG_URL)', () => {
             }
         }
         expect(failures, failures.join('\n')).toEqual([]);
+    }, 60_000);
+
+    it('runs the composed retention deletes for every table (batchedDelete)', async () => {
+        const db = { query: (sql: string, params?: any[], opts?: any) => adapter.query(sql, params, opts) };
+        const cases: Array<[any, string, any[]]> = [
+            ['email_log', '`createdAt` < DATE_SUB(NOW(), INTERVAL ? DAY)', [365]],
+            ['email_link', '`expiresAt` IS NOT NULL AND `expiresAt` < NOW()', []],
+            ['email_event', '`createdAt` < DATE_SUB(NOW(), INTERVAL ? DAY)', [1]],
+            ['email_event', '`emailLogId` < ?', [2]],
+        ];
+        const deleted: number[] = [];
+        for (const [table, where, params] of cases) {
+            await client.query('BEGIN');
+            try { deleted.push(await batchedDelete(db, table, where, params, 0)); } finally { await client.query('ROLLBACK'); }
+        }
+        // Seed: no year-old email; one expired link; events created just now (their occurredAt is older,
+        // but retention cuts on createdAt), so the age cut removes none and the id cut all three of email #1.
+        expect(deleted).toEqual([0, 1, 0, 3]);
+    }, 30_000);
+
+    it('retention through a TypeORM DataSource (DELETE results are [rows, count] there): 12 000 old events, all pruned', async () => {
+        // eslint-disable-next-line @typescript-eslint/no-var-requires
+        const { DataSource } = require('typeorm');
+        const ds = new DataSource({ type: 'postgres', url: PG_URL, entities: [], synchronize: false, logging: false });
+        await ds.initialize();
+        try {
+            await ds.query(`DELETE FROM email_event WHERE source = 'volume'`);
+            await ds.query(`INSERT INTO email_event ("createdAt", "updatedAt", type, source, "occurredAt")
+                            SELECT NOW() - INTERVAL '40 days', NOW(), 'open', 'volume', NOW() - INTERVAL '40 days' FROM generate_series(1, 12000)`);
+            const db = createDbAdapter(ds);
+            const deleted = await batchedDelete(db, 'email_event', "source = 'volume' AND `createdAt` < DATE_SUB(NOW(), INTERVAL ? DAY)", [30], 0);
+            expect(deleted).toBe(12_000);
+            const [{ n }] = await ds.query(`SELECT COUNT(*)::int AS n FROM email_event WHERE source = 'volume'`);
+            expect(n).toBe(0);
+        } finally {
+            await ds.query(`DELETE FROM email_event WHERE source = 'volume'`).catch(() => undefined);
+            await ds.destroy();
+        }
+    }, 60_000);
+
+    it('the per-email daily cap counts that email\'s rows of the type since midnight UTC, bare-id and signed ones apart', async () => {
+        const svc = new EmailEventService({ rawConnection: raw } as any);
+        await client.query('BEGIN');
+        try {
+            const today = new Date();
+            const midnight = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate()));
+            const yesterday = new Date(midnight.getTime() - 3600_000);
+            const add = (at: Date, cls: string | null, type = 'open', log = 77) => client.query(
+                `INSERT INTO email_event ("emailLogId", type, source, "occurredAt", classification) VALUES ($1, $2, 'pixel', $3, $4)`, [log, type, at, cls]);
+            for (let i = 0; i < 3; i++) await add(new Date(midnight.getTime() + 60_000 * (i + 1)), 'human_likely');
+            await add(new Date(midnight.getTime() + 120_000), null); // a cap marker counts with the signed rows
+            for (let i = 0; i < 2; i++) await add(new Date(midnight.getTime() + 180_000), 'unverified');
+            await add(yesterday, 'human_likely');
+            await add(new Date(midnight.getTime() + 60_000), 'human_likely', 'click');
+            await add(new Date(midnight.getTime() + 60_000), 'human_likely', 'open', 78);
+            const count = (unsigned: boolean, type: 'open' | 'click' = 'open') => (svc as any).countEngagement(77, type, unsigned, midnight);
+            expect(await count(false)).toBe(4);
+            expect(await count(true)).toBe(2);
+            expect(await count(false, 'click')).toBe(1);
+        } finally {
+            await client.query('ROLLBACK');
+        }
+    }, 30_000);
+
+    it('the SMTP reply changes the status only from the optimistic `sent`', async () => {
+        const db = createDbAdapter(raw);
+        for (const [current, after] of [['sent', 'deferred'], ['bounced', 'bounced'], ['delivered', 'delivered'], ['complained', 'complained']]) {
+            await client.query('BEGIN');
+            try {
+                const { rows } = await client.query(`INSERT INTO email_log (type, recipient, subject, status) VALUES ('t', 'p@example.com', 's', $1) RETURNING id`, [current]);
+                await db.query("UPDATE email_log SET status = ? WHERE id = ? AND status = 'sent'", ['deferred', rows[0].id], { needAffected: true });
+                expect((await client.query('SELECT status FROM email_log WHERE id = $1', [rows[0].id])).rows[0].status).toBe(after);
+            } finally {
+                await client.query('ROLLBACK');
+            }
+        }
+    }, 30_000);
+
+    it('the boot clock check sees a database session in another time zone', async () => {
+        const db = createDbAdapter(raw);
+        const query = (sql: string) => db.query(sql);
+        await client.query("SET TIME ZONE 'Asia/Kathmandu'"); // UTC+05:45 all year
+        try {
+            const processOffset = -new Date().getTimezoneOffset();
+            expect(await databaseClockSkewMinutes(query, 'postgres')).toBe(345 - processOffset);
+        } finally {
+            await client.query('RESET TIME ZONE');
+        }
+        const sameZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+        await client.query(`SET TIME ZONE '${sameZone.replace(/'/g, '')}'`);
+        try {
+            expect(await databaseClockSkewMinutes(query, 'postgres')).toBe(0);
+        } finally {
+            await client.query('RESET TIME ZONE');
+        }
+    }, 30_000);
+
+    it('the guarded status UPDATE gives exactly nextStatus() for every current × incoming pair', async () => {
+        const svc = new EmailEventService({ rawConnection: raw } as any);
+        const all = Object.keys(STATUS_RANK) as Array<keyof typeof STATUS_RANK>;
+        const wrong: string[] = [];
+        for (const current of all) {
+            for (const incoming of all) {
+                await client.query('BEGIN');
+                try {
+                    const { rows } = await client.query(`INSERT INTO email_log (type, recipient, subject, status) VALUES ('t', 'p@example.com', 's', $1) RETURNING id`, [current]);
+                    await svc.applyStatus(rows[0].id, incoming, 'reason');
+                    const after = (await client.query('SELECT status FROM email_log WHERE id = $1', [rows[0].id])).rows[0].status;
+                    if (after !== nextStatus(current, incoming)) wrong.push(`${current} + ${incoming} → ${after}`);
+                    const drop = statusChangeForEvent('dropped', null)!;
+                    await client.query('UPDATE email_log SET status = $1 WHERE id = $2', [current, rows[0].id]);
+                    await svc.applyStatus(rows[0].id, drop, 'Unsubscribed Address');
+                    const afterDrop = (await client.query('SELECT status FROM email_log WHERE id = $1', [rows[0].id])).rows[0].status;
+                    if (afterDrop !== applyStatusChange(current, drop)) wrong.push(`${current} + non-address drop → ${afterDrop}`);
+                } finally {
+                    await client.query('ROLLBACK');
+                }
+            }
+        }
+        expect(wrong).toEqual([]);
     }, 60_000);
 });

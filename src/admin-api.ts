@@ -232,14 +232,17 @@ export class EmailTrackingAdminResolver {
 
     @Mutation()
     @Allow(Permission.UpdateCustomer)
-    async huloAddEmailSuppression(@Args('input') input: any): Promise<any> {
+    async huloAddEmailSuppression(@Ctx() ctx: RequestContext, @Args('input') input: any): Promise<any> {
         if (!input?.recipient || !input?.reason) throw new Error('recipient and reason are required');
-        return this.tracking.addSuppression(
+        const row = await this.tracking.addSuppression(
             String(input.recipient),
             String(input.reason),
             input.note ? String(input.note) : undefined,
             input.channelId ? Number(input.channelId) : undefined,
         );
+        await this.tracking.recordAdminSuppression(String(input.recipient), String(input.reason),
+            ctx.activeUserId != null ? String(ctx.activeUserId) : null, input.channelId ? Number(input.channelId) : null);
+        return row;
     }
 
     @Mutation()

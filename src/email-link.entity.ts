@@ -68,7 +68,10 @@ export class EmailLink extends VendureEntity {
     @Column({ type: 'int', nullable: true })
     supportTicketId!: number | null;
 
-    @Column({ type: 'varchar', length: 64, unique: true })
+    /** Unique through the class-level `@Index(['linkToken'], { unique: true })`
+     *  (IDX_d58a6a97b688ff39bf86a0f051). Not also `unique: true` here: on MySQL /
+     *  MariaDB TypeORM gave both the same name, so a fresh `synchronize` failed. */
+    @Column({ type: 'varchar', length: 64 })
     linkToken!: string;
 
     @Column({ type: 'int', default: 0 })

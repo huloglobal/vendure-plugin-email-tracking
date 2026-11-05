@@ -7,9 +7,17 @@ import { EmailLinkService } from './email-link.service';
 import { EmailTrackingService } from './email-tracking.service';
 import { EmailTrackingController } from './email-tracking.controller';
 import { TrackingEmailSender } from './tracking-email-sender';
-import { EmailTrackingPluginOptions, setLicenceStatus, setOptions, startEvaluation, getLicenceStatus, stopEvaluation, getOptions, applyGeneratedSigningSecret, setStatsProvider, getStatsProvider } from './options';
+import { EmailTrackingPluginOptions, setLicenceStatus, setOptions, startEvaluation, getLicenceStatus, stopEvaluation, getOptions, applyGeneratedSigningSecret, setStatsProvider, getStatsProvider, isDefaultIpSalt } from './options';
 import { ensureStoredSecret } from './stored-secret';
 import { EmailTrackingAdminResolver, emailTrackingAdminApiSchema } from './admin-api';
+import { EmailEvent } from './email-event.entity';
+import { EmailEventService } from './email-event.service';
+import { OrderActivityService } from './order-activity.service';
+import { OrderActivityController } from './order-activity.controller';
+import { EmailProviderWebhookController } from './email-provider-webhook.controller';
+import { exportEmailEvidencePermission } from './permissions';
+import { bounceBodyMiddleware, providerWebhookBodyMiddleware } from './raw-body';
+import { databaseClockSkewMinutes } from './db-clock';
 
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const PKG_VERSION: string = require('../package.json').version;
@@ -29,6 +37,7 @@ UwIDAQAB
 -----END PUBLIC KEY-----`;
 
 const PLUGIN_ID = 'vendure-plugin-email-tracking';
+
 const SIGNING_SECRET_STORE_KEY = 'vendure-plugin-email-tracking:signing-secret';
 const REVOCATION_URL = process.env.HULO_LICENCE_REVOCATION_URL
     || 'https://elite.charity/licence/revoked.json';
@@ -67,13 +76,29 @@ const REVOCATION_URL = process.env.HULO_LICENCE_REVOCATION_URL
  */
 @VendurePlugin({
     imports: [PluginCommonModule],
-    providers: [EmailTrackingService, EmailTrackingAdminResolver, EmailLinkService],
-    controllers: [EmailTrackingController],
-    entities: [EmailLog, EmailSuppression, EmailLink],
+    providers: [EmailEventService, EmailTrackingService, EmailTrackingAdminResolver, EmailLinkService, OrderActivityService],
+    // A host plugin that imports EmailTrackingPlugin injects these very instances.
+    exports: [EmailTrackingService, EmailEventService, EmailLinkService, OrderActivityService],
+    controllers: [EmailTrackingController, OrderActivityController, EmailProviderWebhookController],
+    entities: [EmailLog, EmailSuppression, EmailLink, EmailEvent],
     compatibility: '^3.0.0',
     adminApiExtensions: {
         schema: emailTrackingAdminApiSchema,
         resolvers: [EmailTrackingAdminResolver],
+    },
+    configuration: config => {
+        // Settings → Roles: the full (unredacted) order activity export.
+        config.authOptions.customPermissions = [...(config.authOptions.customPermissions || []), exportEmailEvidencePermission];
+        // Exact request bytes for the provider webhooks (SendGrid signs them)
+        // and the bounce HMAC. Unknown slugs (404) and addresses over their
+        // failure allowance (429) are answered before a byte is read; every
+        // known slug, configured or not, then gets the same body checks.
+        config.apiOptions.middleware = [
+            ...(config.apiOptions.middleware || []),
+            { route: '/email-track/webhook', handler: providerWebhookBodyMiddleware(), beforeListen: true },
+            { route: '/email-track/bounce', handler: bounceBodyMiddleware(), beforeListen: true },
+        ];
+        return config;
     },
 })
 export class EmailTrackingPlugin {
@@ -129,6 +154,13 @@ export class EmailTrackingPlugin {
             } else {
                 Logger.warn('email-tracking: no signingSecret configured and the licence store is unavailable — tracking links stay unsigned', PKG_NAME);
             }
+        }
+        const skew = await databaseClockSkewMinutes(sql => query(sql), String((this.connection.rawConnection.options as any)?.type || ''));
+        if (skew !== null && Math.abs(skew) >= 2) {
+            Logger.warn(`email-tracking: the database's clock reads ${skew > 0 ? '+' : ''}${skew} minutes from this process's (different time zones?) — times the database sets (order history, email_log.createdAt) and those this process sets (email_event) disagree by that much on the order timeline and the evidence report. Run Node and the database in the same time zone (UTC recommended).`, PKG_NAME);
+        }
+        if (isDefaultIpSalt()) {
+            Logger.warn(`email-tracking: ipSalt is not set — the email_event hashes (IP, recipient) are keyed with the ${getOptions().signingSecret ? 'signing secret' : 'public default salt'}, and the IP hashes in email_log's open / click history use the public default salt, so they can be reversed by trying every address. Set ipSalt to a long random value.`, PKG_NAME);
         }
         if (getLicenceStatus()?.valid) return;
         try {
@@ -203,7 +235,7 @@ export class EmailTrackingPlugin {
             // eslint-disable-next-line no-console
             console.warn(
                 `[@huloglobal/vendure-plugin-email-tracking] ${status.message}` +
-                ` — Running in FREE tier: opens + clicks NOT recorded, suppression list NOT enforced at send, per-template stats + CSV export disabled. Buy a licence at https://elite.charity/licence/buy/${PLUGIN_ID}`,
+                ` — Running in FREE tier: opens + clicks NOT recorded, suppression list NOT enforced at send, per-template stats + CSV export disabled, order email activity + evidence report disabled, provider delivered/deferred/unsubscribe and engagement events NOT recorded (bounces, complaints and drops still are). Buy a licence at https://elite.charity/licence/buy/${PLUGIN_ID}`,
             );
         }
 

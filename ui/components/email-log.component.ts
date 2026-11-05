@@ -1,7 +1,7 @@
 import { Component, OnDestroy, OnInit, ChangeDetectorRef } from '@angular/core';
 import { ActivatedRoute } from '@angular/router';
-import { HttpClient } from '@angular/common/http';
 import { NotificationService } from '@vendure/admin-ui/core';
+import { EmailTrackingHttp, EmailTrackingTier } from './activity-shared';
 
 interface EmailRow {
     id: number;
@@ -202,21 +202,33 @@ interface EmailDetail extends EmailRow {
                     <div class="num" style="color:#1d4ed8">{{ totalAll() }}</div>
                     <div class="lbl">Last {{ summary.fromDays }} days</div>
                 </div>
-                <div class="summary-card" [class.active]="filterStatus==='sent'" (click)="setStatus('sent')">
-                    <div class="num" style="color:#10b981">{{ summary.sent || 0 }}</div>
+                <div class="summary-card" [class.active]="filterStatus==='sent,delivered'" (click)="setStatus('sent,delivered')" title="Accepted for delivery: sent, and delivered as reported by a provider webhook">
+                    <div class="num" style="color:#047857">{{ (summary.sent || 0) + (summary.delivered || 0) }}</div>
                     <div class="lbl">Sent</div>
                 </div>
+                <div class="summary-card" [class.active]="filterStatus==='delivered'" (click)="setStatus('delivered')" title="Delivery confirmed by a provider webhook">
+                    <div class="num" style="color:#15803d">{{ summary.delivered || 0 }}</div>
+                    <div class="lbl">Delivered</div>
+                </div>
                 <div class="summary-card" [class.active]="filterStatus==='failed'" (click)="setStatus('failed')">
-                    <div class="num" style="color:#ef4444">{{ summary.failed || 0 }}</div>
+                    <div class="num" style="color:#b91c1c">{{ summary.failed || 0 }}</div>
                     <div class="lbl">Failed</div>
                 </div>
                 <div class="summary-card" [class.active]="filterStatus==='deferred'" (click)="setStatus('deferred')">
-                    <div class="num" style="color:#f59e0b">{{ summary.deferred || 0 }}</div>
+                    <div class="num" style="color:#b45309">{{ summary.deferred || 0 }}</div>
                     <div class="lbl">Deferred</div>
                 </div>
                 <div class="summary-card" [class.active]="filterStatus==='bounced'" (click)="setStatus('bounced')">
-                    <div class="num" style="color:#9333ea">{{ summary.bounced || 0 }}</div>
+                    <div class="num" style="color:#7e22ce">{{ summary.bounced || 0 }}</div>
                     <div class="lbl">Bounced</div>
+                </div>
+                <div class="summary-card" [class.active]="filterStatus==='complained'" (click)="setStatus('complained')">
+                    <div class="num" style="color:#be185d">{{ summary.complained || 0 }}</div>
+                    <div class="lbl">Complained</div>
+                </div>
+                <div class="summary-card" [class.active]="filterStatus==='suppressed'" (click)="setStatus('suppressed')" title="Not sent: the recipient is on the suppression list">
+                    <div class="num" style="color:#475569">{{ summary.suppressed || 0 }}</div>
+                    <div class="lbl">Suppressed</div>
                 </div>
                 <div class="summary-card">
                     <div class="num" style="color:#0369a1">{{ summary.opens || 0 }}</div>
@@ -228,14 +240,15 @@ interface EmailDetail extends EmailRow {
                 <div class="hulo-card-head">
                     <h4>By template <span class="setup-hint">last 30 days</span></h4>
                     <div class="digest-row">
-                        <span class="unlock-chip" *ngIf="exportLocked">🔒 Premium — <a class="hulo-link" (click)="scrollToLicence()">start the free trial or activate a key</a></span>
+                        <span class="unlock-chip" *ngIf="exportLocked">🔒 Premium — <a class="hulo-link" (click)="scrollToLicence()">subscribe or activate a key</a></span>
                         <button class="btn btn-sm btn-secondary" (click)="exportCsv()" [disabled]="exporting">{{ exporting ? 'Exporting…' : 'Export CSV' }}</button>
                     </div>
                 </div>
-                <div *ngIf="byTemplateLocked" class="unlock-chip">🔒 Per-template open and click rates are a premium feature — <a class="hulo-link" (click)="scrollToLicence()">start the free trial or activate a key</a> at the top of this page.</div>
+                <div *ngIf="byTemplateLocked" class="unlock-chip">🔒 Per-template open and click rates are a premium feature — <a class="hulo-link" (click)="scrollToLicence()">subscribe or activate a key</a> at the top of this page.</div>
                 <div *ngIf="!byTemplateLocked && byTemplateLoading" class="setup-hint">Loading…</div>
                 <div *ngIf="!byTemplateLocked && !byTemplateLoading && byTemplate.length === 0" class="setup-hint">No emails in the last 30 days.</div>
-                <table class="table table-compact" *ngIf="!byTemplateLocked && byTemplate.length > 0" style="margin-top:0">
+                <div class="scroll-x" *ngIf="!byTemplateLocked && byTemplate.length > 0">
+                <table class="table table-compact" style="margin-top:0">
                     <thead><tr><th>Template</th><th>Sent</th><th>Opened</th><th>Open rate</th><th>Clicked</th><th>Click rate</th><th>Bounced</th><th>Failed</th></tr></thead>
                     <tbody>
                         <tr *ngFor="let t of byTemplate">
@@ -250,6 +263,7 @@ interface EmailDetail extends EmailRow {
                         </tr>
                     </tbody>
                 </table>
+                </div>
             </div>
         </vdr-page-block>
 
@@ -270,7 +284,8 @@ interface EmailDetail extends EmailRow {
                         No emails match this view.
                     </div>
 
-                    <table class="table table-compact" *ngIf="rows.length > 0">
+                    <div class="scroll-x" *ngIf="rows.length > 0">
+                    <table class="table table-compact">
                         <thead>
                             <tr>
                                 <th>#</th>
@@ -305,9 +320,10 @@ interface EmailDetail extends EmailRow {
                                     <td>
                                         <span [class.muted]="r.clickCount === 0" [style.color]="r.clickCount > 0 ? '#0369a1' : null">{{ r.clickCount }}</span>
                                     </td>
-                                    <td>
+                                    <td class="linked-cell">
                                         <a *ngIf="r.orderId" [routerLink]="['/orders', r.orderId]">{{ r.orderCode || r.orderId }}</a>
-                                        <a *ngIf="r.customerId && !r.orderId" [routerLink]="['/customers', r.customerId]">cust #{{ r.customerId }}</a>
+                                        <a *ngIf="r.orderId" class="help-text activity-link" [routerLink]="['/extensions', 'email-log', 'orders', r.orderId]" title="Email and order activity for this order">activity</a>
+                                        <a *ngIf="r.customerId && !r.orderId" [routerLink]="['/customer', 'customers', r.customerId, 'emails']" title="The customer's Emails tab">cust #{{ r.customerId }}</a>
                                         <span *ngIf="!r.orderId && !r.customerId" class="help-text">—</span>
                                     </td>
                                     <td>
@@ -392,6 +408,7 @@ interface EmailDetail extends EmailRow {
                             </ng-container>
                         </tbody>
                     </table>
+                    </div>
 
                     <div class="pager" *ngIf="total > take">
                         <button class="btn btn-sm" (click)="prevPage()" [disabled]="skip === 0">‹ Prev</button>
@@ -447,8 +464,10 @@ interface EmailDetail extends EmailRow {
         .hulo-hero-title { color: #fff; font-size: 22px; font-weight: 700; margin: 0; letter-spacing: -0.01em; }
         .hulo-hero-sub { color: #cbd5e1; font-size: 13px; line-height: 1.5; margin: 4px 0 0; max-width: 640px; }
         .hulo-hero-actions { display: flex; gap: 6px; align-items: center; flex: 0 0 auto; }
-        .hulo-hero-actions .btn { color: #f8fafc; }
-        .hulo-hero-actions .btn:hover { color: #f59e0b; }
+        /* Outlined on the dark hero: Vendure 3.7 gives .btn a light background, which hid the white label. */
+        .hulo-hero-actions .btn { color: #f8fafc; background: transparent; border: 1px solid rgba(248,250,252,.4); }
+        .hulo-hero-actions .btn:hover, .hulo-hero-actions .btn:focus-visible { color: #f59e0b; background: rgba(248,250,252,.08); border-color: #f59e0b; }
+        .hulo-hero-actions .btn clr-icon { color: inherit; }
         .hulo-help-btn clr-icon { margin-right: 4px; }
         .hulo-help-drawer {
             background: #fffbeb; border: 1px solid #fde68a; border-radius: 12px;
@@ -506,11 +525,18 @@ interface EmailDetail extends EmailRow {
             color: var(--color-text-100, inherit);
             border: 1px solid var(--color-component-border-200);
         }
-        .status-sent { background: #10b981; }
-        .status-failed { background: #ef4444; }
-        .status-deferred { background: #f59e0b; }
-        .status-bounced { background: #9333ea; }
-        .status-complained { background: #db2777; }
+        /* White on each status colour is at least 4.5:1 (WCAG AA). */
+        .status-sent { background: #047857; }
+        .status-delivered { background: #15803d; }
+        .status-failed { background: #b91c1c; }
+        .status-deferred { background: #b45309; }
+        .status-bounced { background: #7e22ce; }
+        .status-complained { background: #be185d; }
+        .status-suppressed { background: #475569; }
+        .linked-cell { white-space: normal; }
+        .activity-link { display: block; }
+        /* Wide tables scroll inside their own box; the page never grows wider than the screen. */
+        .scroll-x { overflow-x: auto; contain: inline-size; width: 100%; -webkit-overflow-scrolling: touch; }
 
         .detail-row > td {
             background: var(--color-component-bg-200);
@@ -549,8 +575,8 @@ interface EmailDetail extends EmailRow {
 
             /* Card-block scrolls horizontally; table keeps natural layout */
             .card-block { padding: 12px; overflow-x: auto; -webkit-overflow-scrolling: touch; }
-            .card-block > table { white-space: nowrap; }
-            .card-block > table th, .card-block > table td { padding: 8px 10px; }
+            .card-block .scroll-x > table { white-space: nowrap; }
+            .card-block .scroll-x > table th, .card-block .scroll-x > table td { padding: 8px 10px; }
             .detail-row > td { padding: 12px; display: block; }
             .detail-grid { grid-template-columns: 1fr; gap: 10px; }
             .pager { justify-content: center; }
@@ -574,7 +600,7 @@ export class EmailLogComponent implements OnInit, OnDestroy {
      *  customer (used by the per-customer Emails tab). */
     lockedCustomerId: string | null = null;
 
-    summary: any = { sent: 0, failed: 0, deferred: 0, bounced: 0, opens: 0, clicks: 0, fromDays: 30 };
+    summary: any = { total: 0, sent: 0, delivered: 0, failed: 0, deferred: 0, bounced: 0, complained: 0, suppressed: 0, opens: 0, clicks: 0, fromDays: 30 };
 
     expandedId: number | null = null;
     detail: EmailDetail | null = null;
@@ -603,7 +629,7 @@ export class EmailLogComponent implements OnInit, OnDestroy {
     errMsg(e: any, what: string): string {
         const code = e?.error?.error;
         if (e?.status === 402 || code === 'licence-required' || code === 'licence_required' || code === 'premium-feature') {
-            return `${what} needs a licence — start the free trial or activate a key at the top of this page.`;
+            return `${what} needs a licence — subscribe or activate a key at the top of this page.`;
         }
         const m = e?.error?.message || (typeof e?.error?.error === 'string' ? e.error.error : '') || e?.message;
         return m ? `${what} failed: ${m}` : `${what} failed`;
@@ -732,7 +758,9 @@ export class EmailLogComponent implements OnInit, OnDestroy {
     }
 
     constructor(
-        private http: HttpClient,
+        // The plugin's REST client: channel + bearer headers, and no generic error toast on top of this page's own messages.
+        private http: EmailTrackingHttp,
+        private tier: EmailTrackingTier,
         private notify: NotificationService,
         private route: ActivatedRoute,
         private cdr: ChangeDetectorRef,
@@ -806,16 +834,18 @@ export class EmailLogComponent implements OnInit, OnDestroy {
         });
     }
 
-    loadLicMeta() {
+    loadLicMeta(then?: () => void) {
         this.http.get<any>('/email-track/licence/status').subscribe({
             next: m => {
                 this.licMeta = m;
+                this.tier.reset();
                 let dismissed = '';
                 try { dismissed = localStorage.getItem(this.dismissKey) || ''; } catch {}
                 this.updateDismissed = !!m?.update?.latest && dismissed === m.update.latest;
                 this.cdr.markForCheck();
+                then?.();
             },
-            error: () => undefined,
+            error: () => then?.(),
         });
     }
 
@@ -849,7 +879,10 @@ export class EmailLogComponent implements OnInit, OnDestroy {
                 else this.stopClaimPoll();
                 if (r?.licensed && (wasPending || r?.state === 'installed') && !this.licMeta?.licensed) {
                     this.notify.success('Licence installed — all features enabled');
-                    this.http.get<any>('/email-track/licence/status').subscribe({ next: m => { this.licMeta = m; this.cdr.markForCheck(); }, error: () => undefined });
+                    this.http.get<any>('/email-track/licence/status').subscribe({
+                        next: m => { this.licMeta = m; this.tier.reset(); if (m?.tier !== 'free') this.loadByTemplate(); this.cdr.markForCheck(); },
+                        error: () => undefined,
+                    });
                 }
                 this.cdr.markForCheck();
             },
@@ -890,7 +923,7 @@ export class EmailLogComponent implements OnInit, OnDestroy {
                 this.licActivating = false;
                 this.licKeyInput = '';
                 this.notify.success(r?.message || 'Licence activated — all features enabled');
-                this.loadLicMeta();
+                this.loadLicMeta(() => { if (this.licMeta?.tier !== 'free') this.loadByTemplate(); });
                 this.cdr.markForCheck();
             },
             error: e => {
@@ -903,7 +936,11 @@ export class EmailLogComponent implements OnInit, OnDestroy {
 
     ngOnInit() {
         this.checkClaim(false);
-        this.loadLicMeta();
+        // Per-template rates are premium: an unlicensed install gets the notice without the request (and its 402).
+        this.loadLicMeta(() => {
+            if (this.licMeta?.tier === 'free') { this.byTemplateLocked = true; this.cdr.markForCheck(); }
+            else this.loadByTemplate();
+        });
         const cId = this.route.snapshot.queryParamMap.get('customerId');
         if (cId) {
             this.lockedCustomerId = cId;
@@ -913,7 +950,6 @@ export class EmailLogComponent implements OnInit, OnDestroy {
         if (oCode) this.filterOrderCode = oCode;
         this.loadSetup();
         this.loadDigest();
-        this.loadByTemplate();
         this.load();
     }
 
@@ -923,9 +959,11 @@ export class EmailLogComponent implements OnInit, OnDestroy {
         this.updateDismissed = true;
     }
 
+    /** Every email of the period, whatever its status (the server's `total`; summed here for an older server). */
     totalAll(): number {
-        return (this.summary.sent || 0) + (this.summary.failed || 0) + (this.summary.deferred || 0)
-            + (this.summary.bounced || 0) + (this.summary.complained || 0);
+        if (typeof this.summary?.total === 'number') return this.summary.total;
+        return ['sent', 'delivered', 'failed', 'deferred', 'bounced', 'complained', 'suppressed']
+            .reduce((n, k) => n + (Number(this.summary?.[k]) || 0), 0);
     }
 
     setStatus(s: string) {

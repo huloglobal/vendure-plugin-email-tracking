@@ -16,5 +16,13 @@ export { EmailLog, EmailLogStatus } from './email-log.entity';
 export { EmailSuppression } from './email-suppression.entity';
 export { EmailLink, EmailLinkType } from './email-link.entity';
 export { EmailLinkService } from './email-link.service';
-export { EmailTrackingPluginOptions } from './options';
+export { EmailTrackingPluginOptions, ProviderWebhookOptions } from './options';
 export { parseEmailClient, ParsedClient } from './parse-ua';
+// 0.16.0 — event timeline, order activity, provider webhooks, IP enrichment
+export { EmailEvent } from './email-event.entity';
+export { EmailEventService, RecordEventInput } from './email-event.service';
+export { OrderActivityService, ActivitySummary } from './order-activity.service';
+export { exportEmailEvidencePermission } from './permissions';
+export { IpEnrichmentOptions, IpEnrichmentResult } from './ip-enrichment';
+export { EmailEventType, EmailEventSource, EventClassification, STATUS_RANK, nextStatus } from './event-types';
+export { TimelineItem, TimelineFilter } from './timeline';

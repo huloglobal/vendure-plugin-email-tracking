@@ -1,11 +1,9 @@
 import { Body, Controller, Delete, Get, Param, Post, Query, Req, Res } from '@nestjs/common';
-import { Ctx, Logger, Permission, RequestContext, TransactionalConnection } from '@vendure/core';
+import { Ctx, Logger, RequestContext, TransactionalConnection } from '@vendure/core';
 import {
     applySecurityHeaders,
-    isLicensed,
     isUrlOnAllowlist,
     premiumFeatureError,
-    RateLimiter,
     verifyHmacSha256,
     verifySignedValue, LicenceStore, performSelfUpdate, selfUpdateEnv, adapterFor, PurchaseClaimClient, evalInstanceId, describeLicence } from '@huloglobal/vendure-licence-sdk';
 import { Request, Response } from 'express';
@@ -15,6 +13,10 @@ import { EmailTrackingService, PREMIUM_FEATURES, effectiveTier, recentStatLines 
 import { EmailLinkService } from './email-link.service';
 import { EmailTrackingPlugin } from './plugin';
 import { getOptions, getLicenceStatus, hasPremiumAccess, getEvalState, getEvalInstanceId, configuredSigningSecret } from './options';
+import { dateParam, getLimiter, intParam, realIp, requireAdmin, scopedChannel } from './http-helpers';
+import { verifyClickSignature } from './click-signature';
+import { csvCell, CSV_BOM } from './csv';
+import { redactSensitiveUrl } from './link-meta';
 
 const loggerCtx = 'EmailTrackingController';
 
@@ -28,61 +30,13 @@ function ownHosts(): string[] {
     return [...out].filter(Boolean);
 }
 
-/** Process-wide rate limiter shared across all open / click / bounce
- *  requests. Sized to comfortably handle a normal store's traffic while
- *  blocking floods. Configurable via plugin options. */
-let limiter: RateLimiter | null = null;
-function getLimiter(): RateLimiter {
-    if (!limiter) {
-        const rl = getOptions().rateLimit || { capacity: 60, windowMs: 60_000 };
-        limiter = new RateLimiter({ capacity: rl.capacity, windowMs: rl.windowMs });
-    }
-    return limiter;
-}
-
 // 1×1 transparent GIF (43 bytes) returned by the open-tracking endpoint.
 const ONE_PX_GIF = Buffer.from(
     'R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7',
     'base64',
 );
 
-import { getRealIp } from './proxy-headers';
-import { verifyClickSignature } from './click-signature';
-
 const PLUGIN_ID_FOR_STORE = 'vendure-plugin-email-tracking';
-function realIp(req: Request): string | null { return getRealIp(req, getOptions().trustedIpHeaders || []); }
-
-/** Bounded integer from a query/body value; null when it is not one. */
-function intParam(v: unknown, min: number, max: number): number | null {
-    if (v === undefined || v === null || v === '') return null;
-    const n = Number(v);
-    return Number.isInteger(n) && n >= min && n <= max ? n : null;
-}
-function dateParam(v: unknown): Date | null {
-    if (!v) return null;
-    const d = new Date(String(v));
-    return Number.isNaN(d.getTime()) ? null : d;
-}
-/** The channel an admin read is scoped to: null for the default channel (sees everything). */
-function scopedChannel(ctx: RequestContext): number | null {
-    if (!ctx?.channelId) return null;
-    if (ctx.channel?.code === '__default_channel__' || String(ctx.channelId) === '1') return null;
-    return Number(ctx.channelId);
-}
-
-function requireAdmin(ctx: RequestContext, res: Response, write: boolean | 'ops' = false): boolean {
-    if (!ctx?.activeUserId) {
-        res.status(401).json({ error: 'Authentication required' });
-        return false;
-    }
-    // 'ops': self-update and licence changes affect the whole install.
-    const needed = write === 'ops' ? [Permission.SuperAdmin] : write ? [Permission.UpdateCustomer] : [Permission.ReadCustomer];
-    if (!ctx.userHasPermissions(needed)) {
-        res.status(403).json({ error: 'Insufficient permissions' });
-        return false;
-    }
-    return true;
-}
 
 @Controller('email-track')
 export class EmailTrackingController {
@@ -202,9 +156,7 @@ export class EmailTrackingController {
     async digestPreview(@Ctx() ctx: RequestContext, @Res() res: Response) {
         if (!requireAdmin(ctx, res, false)) return;
         const mail = await this.tracking.digestPreview();
-        applySecurityHeaders(res);
         res.setHeader('Content-Type', 'text/html; charset=utf-8');
-        res.setHeader('Cache-Control', 'no-store');
         return res.send(mail.html);
     }
 
@@ -341,12 +293,14 @@ export class EmailTrackingController {
             return res.end();
         }
 
-        const id = this.resolveSignedId(token);
+        const resolved = this.resolveSignedId(token);
+        const id = resolved?.id ?? null;
         if (id !== null && hasPremiumAccess()) {
             // Open tracking is a paid feature. Unlicensed installs still
             // serve the pixel (so emails don't show a broken image) but
-            // do not record the open.
-            this.tracking.recordOpen(id, ip, req.headers['user-agent'] as string || null)
+            // do not record the open. A bare id is recorded as unsigned (or
+            // not at all when the email's own links were signed).
+            this.tracking.recordOpen(id, ip, req.headers['user-agent'] as string || null, { signed: !!resolved?.signed })
                 .catch((e: any) => Logger.warn(`open log fail #${id}: ${e?.message}`, loggerCtx));
         }
         // Always return the pixel — never leak whether the id was real
@@ -391,7 +345,8 @@ export class EmailTrackingController {
             return res.status(400).send('Invalid redirect target');
         }
         if (/^[0-9a-f]{64}$/.test(token)) return this.clickLinkToken(token, url, String(sig || ''), ip, req, res);
-        const id = this.resolveSignedId(token);
+        const resolved = this.resolveSignedId(token);
+        const id = resolved?.id ?? null;
         // Never redirect for a token we cannot tie to an email we sent: with a
         // signing secret that closes the open redirector completely. Legacy
         // unsigned ids (emails sent before a secret existed) may only redirect
@@ -417,7 +372,9 @@ export class EmailTrackingController {
         if (id !== null && hasPremiumAccess()) {
             // Click tracking is paid. Unlicensed mode still redirects
             // (we don't break the customer's email) but doesn't log.
-            await this.tracking.recordClick(id, url, ip, req.headers['user-agent'] as string || null)
+            // Recorded after the redirect is on its way: a slow lookup or
+            // database never holds the customer up.
+            this.tracking.recordClick(id, url, ip, req.headers['user-agent'] as string || null, undefined, { signed: !!resolved?.signed })
                 .catch((e: any) => Logger.warn(`click log fail #${id}: ${e?.message}`, loggerCtx));
         }
         res.setHeader('Cache-Control', 'no-store');
@@ -439,7 +396,9 @@ export class EmailTrackingController {
         }
         if (link.emailLogId && link.isTrackingEnabled !== false && hasPremiumAccess()) {
             const recorded = link.isSensitive ? (link.destinationUrlRedacted || `[sensitive: ${link.destinationUrlHost || 'unknown'}]`) : url;
-            await this.tracking.recordClick(Number(link.emailLogId), recorded, ip, req.headers['user-agent'] as string || null)
+            // Fire-and-forget, as for the pixel: the redirect never waits on the recording.
+            this.tracking.recordClick(Number(link.emailLogId), recorded, ip, req.headers['user-agent'] as string || null,
+                { linkIndex: link.linkIndex ?? null, linkText: link.linkText || link.linkLabel || null })
                 .catch((e: any) => Logger.warn(`click log fail (link ${link.id}): ${e?.message}`, loggerCtx));
         }
         res.setHeader('Cache-Control', 'no-store');
@@ -447,26 +406,30 @@ export class EmailTrackingController {
     }
 
     /**
-     * Resolve a path parameter back to a numeric email-log id.
+     * Resolve a path parameter back to a numeric email-log id, and whether
+     * the token carried a valid signature.
      *
-     * If a `signingSecret` is configured, we expect a token of the form
-     * `<id>.<hmac>`. If no secret is configured, we accept a bare
-     * numeric id (legacy behaviour) — but still parse strictly so a
-     * malicious caller can't slip a path traversal in.
+     * With a signing secret, `<id>.<hmac>` tokens are verified (`signed`).
+     * A bare numeric id — links in emails sent before any secret existed —
+     * is still accepted but `signed: false`: anyone can type one, so while
+     * a secret exists its opens and clicks are recorded as `unverified`
+     * events only (reason `unsigned-token`, never enriched, never counted in
+     * `email_log`), and not recorded at all when that email's own links were
+     * signed. Parsed strictly so nothing like a path traversal slips in.
      */
-    private resolveSignedId(raw: string): number | null {
+    private resolveSignedId(raw: string): { id: number; signed: boolean } | null {
         if (!raw) return null;
         const secret = getOptions().signingSecret;
         if (secret && raw.includes('.')) {
             const value = verifySignedValue(raw, secret);
             if (!value || !/^\d{1,12}$/.test(value)) return null;
             const id = parseInt(value, 10);
-            return id > 0 ? id : null;
+            return id > 0 ? { id, signed: true } : null;
         }
         // Bare id: only the exact decimal form ("12abc" and 64-hex link tokens are not ids).
         if (!/^\d{1,12}$/.test(raw)) return null;
         const id = parseInt(raw, 10);
-        return id > 0 ? id : null;
+        return id > 0 ? { id, signed: false } : null;
     }
 
     /**
@@ -500,7 +463,8 @@ export class EmailTrackingController {
             return res.status(503).json({ error: 'bounce webhook disabled: set bounceWebhookSecret (or allowUnauthenticatedBounceWebhook: true on a private network)' });
         }
         const bounceIp = realIp(req);
-        if (bounceIp && !getLimiter().allow(`bounce|${bounceIp}`)) {
+        // The body middleware already took this request's token from the limiter.
+        if (!(req as any).huloRateChecked && bounceIp && !getLimiter().allow(`bounce|${bounceIp}`)) {
             res.setHeader('Retry-After', '60');
             return res.status(429).json({ error: 'Too many requests' });
         }
@@ -508,16 +472,14 @@ export class EmailTrackingController {
             const sig = (req.headers['x-signature'] as string)
                 || (req.headers['x-hub-signature-256'] as string)
                 || '';
-            // Use rawBody if available; otherwise reconstruct from the
-            // parsed body. Vendure mounts `express.json()` globally so
-            // rawBody isn't preserved by default — recommend wiring it
-            // for /email-track/bounce specifically. The reconstructed
-            // form is consistent enough for HMAC if the sender uses
-            // canonical JSON.
-            const payload = (req as any).rawBody
-                ? (req as any).rawBody
-                : Buffer.from(JSON.stringify(body || {}));
-            if (!verifyHmacSha256(payload, sig, secret)) {
+            // Since 0.16.0 the plugin captures the exact request bytes on this
+            // route (raw-body.ts), so the HMAC is checked over what was sent.
+            // Senders that signed the compact JSON form (what 0.15.x verified,
+            // with no raw body available) keep working through the fallback.
+            const raw: Buffer | undefined = (req as any).rawBody;
+            const ok = (raw && verifyHmacSha256(raw, sig, secret))
+                || verifyHmacSha256(Buffer.from(JSON.stringify(body || {})), sig, secret);
+            if (!ok) {
                 return res.status(401).json({ error: 'Invalid signature' });
             }
         }
@@ -554,7 +516,13 @@ export class EmailTrackingController {
         };
         if (!int('customerId', 'customerId') || !int('orderId', 'orderId') || !int('invoiceId', 'invoiceId')) return { error: 'ids must be positive integers' };
         if (q.orderCode) { where.push('\`orderCode\` = ?'); params.push(String(q.orderCode).slice(0, 64)); }
-        if (q.status) { where.push('status = ?'); params.push(String(q.status).slice(0, 32)); }
+        if (q.status) {
+            // One status, or several comma-separated (`sent,delivered`: everything accepted).
+            const list = Array.from(new Set(String(q.status).split(',').map(x => x.trim()).filter(Boolean))).slice(0, 8);
+            if (!list.length || list.some(x => x.length > 32)) return { error: 'status must be one or more comma-separated statuses' };
+            where.push(list.length === 1 ? 'status = ?' : `status IN (${list.map(() => '?').join(', ')})`);
+            params.push(...list);
+        }
         if (q.type) { where.push('type = ?'); params.push(String(q.type).slice(0, 64)); }
         if (q.recipient) { where.push('recipient LIKE ?'); params.push(`%${String(q.recipient).slice(0, 190).replace(/[\\%_]/g, m => '\\' + m)}%`); }
         if (q.from) { const d = dateParam(q.from); if (!d) return { error: 'from is not a date' }; where.push('\`createdAt\` >= ?'); params.push(d); }
@@ -606,30 +574,15 @@ export class EmailTrackingController {
              GROUP BY status`,
             scope ? [fromDays, scope] : [fromDays],
         );
-        const summary: any = { sent: 0, failed: 0, deferred: 0, bounced: 0, complained: 0, opens: 0, clicks: 0, fromDays };
+        // Every status, `total` over all of them (delivered and suppressed included).
+        const summary: any = { total: 0, sent: 0, delivered: 0, failed: 0, deferred: 0, bounced: 0, complained: 0, suppressed: 0, opens: 0, clicks: 0, fromDays };
         for (const r of rows) {
             summary[r.status] = Number(r.n);
+            summary.total += Number(r.n) || 0;
             summary.opens += Number(r.opens) || 0;
             summary.clicks += Number(r.clicks) || 0;
         }
         return res.json(summary);
-    }
-
-    /** Admin: full detail for one event including the clicks JSON. */
-    @Get('log/:id')
-    async logDetail(@Ctx() ctx: RequestContext, @Param('id') idParam: string, @Res() res: Response) {
-        if (!requireAdmin(ctx, res, false)) return;
-        const id = parseInt(idParam, 10);
-        if (!id) return res.status(400).json({ error: 'Invalid id' });
-        const row = await this.connection.rawConnection.getRepository(EmailLog).findOne({ where: { id } });
-        // Same channel scope as the list: a channel admin never reads another channel's email.
-        const scope = scopedChannel(ctx);
-        if (!row || (scope && Number(row.channelId) !== scope)) return res.status(404).json({ error: 'Not found' });
-        let clicks: any[] = [];
-        let opens: any[] = [];
-        try { clicks = JSON.parse(row.clicksJson || '[]'); } catch {}
-        try { opens = JSON.parse(row.opensJson || '[]'); } catch {}
-        return res.json({ ...row, clicks, opens, clicksJson: undefined, opensJson: undefined });
     }
 
     /** Admin: per-template aggregates — open rate + CTR by `type`.
@@ -686,18 +639,13 @@ export class EmailTrackingController {
              ORDER BY id DESC LIMIT 50000`,
             params,
         );
+        // Cache-Control: private, no-store (requireAdmin): a CDN that caches .csv must never keep an export.
         res.setHeader('Content-Type', 'text/csv; charset=utf-8');
         res.setHeader('Content-Disposition', `attachment; filename="email-log-${new Date().toISOString().slice(0, 10)}.csv"`);
-        const esc = (v: any): string => {
-            if (v === null || v === undefined) return '';
-            let s = String(v);
-            // A cell starting with = + - @ (or a tab/CR) would run as a formula in Excel/Sheets.
-            if (/^[=+\-@\t\r]/.test(s)) s = `'${s}`;
-            s = s.replace(/"/g, '""');
-            return /[",\n]/.test(s) ? `"${s}"` : s;
-        };
+        // Formula-injection guard + quoting (csv.ts, shared with the order activity export).
+        const esc = csvCell;
         const header = 'createdAt,type,recipient,subject,status,openCount,clickCount,customerId,orderCode,invoiceId,smtpMessageId,errorMessage\n';
-        res.write(header);
+        res.write(CSV_BOM + header);
         for (const r of rows) {
             res.write([
                 esc(r.createdAt instanceof Date ? r.createdAt.toISOString() : r.createdAt),
@@ -708,6 +656,28 @@ export class EmailTrackingController {
             ].join(',') + '\n');
         }
         return res.end();
+    }
+
+    /** Admin: full detail for one email including the opens and clicks JSON. Declared after the fixed
+     *  `log/…` routes: Nest matches routes in declaration order, and `log/:id` would take `log/export.csv`. */
+    @Get('log/:id')
+    async logDetail(@Ctx() ctx: RequestContext, @Param('id') idParam: string, @Res() res: Response) {
+        if (!requireAdmin(ctx, res, false)) return;
+        // Digits only: `1.csv`, `1.pdf` or `1%2Fx.css` are not an email of the log (and must never answer
+        // with one: a CDN that caches by extension would keep it).
+        const id = /^\d{1,10}$/.test(String(idParam)) ? intParam(idParam, 1, 2147483647) : null;
+        if (id === null) return res.status(404).json({ error: 'Not found' });
+        const row = await this.connection.rawConnection.getRepository(EmailLog).findOne({ where: { id } });
+        // Same channel scope as the list: a channel admin never reads another channel's email.
+        const scope = scopedChannel(ctx);
+        if (!row || (scope && Number(row.channelId) !== scope)) return res.status(404).json({ error: 'Not found' });
+        let clicks: any[] = [];
+        let opens: any[] = [];
+        try { clicks = JSON.parse(row.clicksJson || '[]'); } catch {}
+        try { opens = JSON.parse(row.opensJson || '[]'); } catch {}
+        // Click history written before 0.16.0 kept raw URLs: never show a live reset or magic-link token.
+        if (Array.isArray(clicks)) clicks = clicks.map(c => (c && typeof c.url === 'string' ? { ...c, url: redactSensitiveUrl(c.url) } : c));
+        return res.json({ ...row, clicks, opens, clicksJson: undefined, opensJson: undefined });
     }
 
     /** Admin: list suppression entries. */
@@ -743,6 +713,8 @@ export class EmailTrackingController {
             body?.note ? String(body.note).slice(0, 2000) : undefined,
             channelId ?? undefined,
         );
+        // On the timeline too (unlinked; the address is only kept as a salted hash there).
+        await this.tracking.recordAdminSuppression(recipient, reason, ctx.activeUserId != null ? String(ctx.activeUserId) : null, channelId ?? null);
         return res.json({ ok: true, row });
     }
 
