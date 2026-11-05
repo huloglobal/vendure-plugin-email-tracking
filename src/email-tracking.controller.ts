@@ -53,7 +53,8 @@ export class EmailTrackingController {
      * GET /email-track/status
      */
 
-    private licenceStore = new LicenceStore((sql: string, params?: any[]) => adapterFor(this.connection.rawConnection).query(sql, params));
+    // Pass `opts` through: on PostgreSQL LicenceStore.save needs its conflict columns for the upsert.
+    private licenceStore = new LicenceStore((sql: string, params?: any[], opts?: any) => adapterFor(this.connection.rawConnection).query(sql, params, opts));
 
     /** Licence/evaluation state for the admin banner, plus the lifecycle
      *  notice, what the free tier loses and the top 30-day figures. */

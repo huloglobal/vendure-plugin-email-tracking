@@ -5,6 +5,16 @@ documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) and this project
 adheres to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.16.1] — 2026-11-05
+
+### Fixed
+- **PostgreSQL: activating a licence key from the admin failed.** The admin
+  controller's licence-store wrapper dropped the options argument, so the
+  upsert that stores an activated key had no conflict columns and threw on
+  PostgreSQL: the key applied until the next restart, the request answered
+  500 and the key was never stored. It is now passed through (MySQL/MariaDB
+  were not affected).
+
 ## [0.16.0] — 2026-11-04
 
 Delivery evidence: every email event is now recorded as its own row, the
