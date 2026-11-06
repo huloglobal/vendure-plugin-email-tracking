@@ -183,40 +183,9 @@ export class EmailTrackingAdminResolver {
             throw new Error(premiumFeatureError('vendure-plugin-email-tracking').message);
         }
         const days = Math.min(Math.max(Number(daysInput) || 30, 1), 365);
-        const scope = channelScope(ctx);
-        const rows = await adapterFor(this.connection.rawConnection).query(
-            `SELECT type,
-                    COUNT(*)                                                                AS sent,
-                    SUM(CASE WHEN \`openCount\` > 0 THEN 1 ELSE 0 END)                       AS opened,
-                    SUM(CASE WHEN \`clickCount\` > 0 THEN 1 ELSE 0 END)                      AS clicked,
-                    SUM(CASE WHEN status='bounced' OR status='complained' THEN 1 ELSE 0 END) AS bounced,
-                    SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END)                        AS failed,
-                    SUM(CASE WHEN status='suppressed' THEN 1 ELSE 0 END)                    AS suppressed,
-                    SUM(\`openCount\`)                                                       AS totalOpens,
-                    SUM(\`clickCount\`)                                                      AS totalClicks
-             FROM email_log
-             WHERE \`createdAt\` >= DATE_SUB(NOW(), INTERVAL ? DAY)${scope ? ' AND \`channelId\` = ?' : ''}
-             GROUP BY type
-             ORDER BY sent DESC`,
-            scope ? [days, scope] : [days],
-        );
-        return {
-            days,
-            types: rows.map((r: any) => ({
-                type: r.type || '(unspecified)',
-                sent: Number(r.sent) || 0,
-                opened: Number(r.opened) || 0,
-                clicked: Number(r.clicked) || 0,
-                bounced: Number(r.bounced) || 0,
-                failed: Number(r.failed) || 0,
-                suppressed: Number(r.suppressed) || 0,
-                totalOpens: Number(r.totalOpens) || 0,
-                totalClicks: Number(r.totalClicks) || 0,
-                openRate:  r.sent > 0 ? Number(r.opened)  / Number(r.sent) : 0,
-                clickRate: r.sent > 0 ? Number(r.clicked) / Number(r.sent) : 0,
-                ctor:      r.opened > 0 ? Number(r.clicked) / Number(r.opened) : 0,
-            })),
-        };
+        // The Email Log's By template figures: `sent` accepted by the mail server, `failed` failed for good.
+        const types = await this.tracking.statsByTemplate(days, channelScope(ctx));
+        return { days, types: types.map(t => ({ ...t, type: t.type || '(unspecified)' })) };
     }
 
     @Query()

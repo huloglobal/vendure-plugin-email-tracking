@@ -30,6 +30,13 @@ export const HOW_TO_READ = [
     'Raw events are not deduplicated: each pixel fetch and each click is its own row, up to 100 opens and 100 clicks per email per day; beyond that one "not stored" row marks the day and the opened / clicked counts keep counting. Rows marked "legacy" were reconstructed from the email log for emails sent before version 0.16.0.',
     'Rows marked "unverified" came through a tracking link without a signature. Anyone who knows the email\'s number can produce such a row, so they prove nothing: they are not counted in the opened, clicked or human / machine figures.',
     'Delivery, bounce and complaint rows come from the plugin\'s own send path, the bounce webhook or the mail provider\'s signed webhooks.',
+    '"Accepted by the mail server" means the SMTP server took the email; delivery to the inbox is known only when a provider webhook reports it. '
+        + '"Sending…" means no reply from the mail server has been recorded yet, and "No reply recorded" that none ever was (the send was cut off, '
+        + 'for example by a restart). Rows marked "from email log" were read from the email log because the email has no send event.',
+    'A temporary refusal (an SMTP 4xx reply, a connection error or a timeout) reads "Deferred, retrying" while the email can still be sent again. '
+        + 'Once it is, the attempts are linked: "Deferred, retried" ("Send failed, retried" after a permanent refusal, "No reply recorded, retried" '
+        + 'after a cut-off send), then "Sent after 1 retry". "Send failed" means a permanent refusal (an SMTP 5xx reply or any other error) with no '
+        + 'later attempt, or that the retries are over: none came within 15 minutes, or the sixth attempt failed.',
     'Private (internal) order notes are left out unless the report was requested with them; they are then marked "internal". Order-history entries of a kind this report does not know show their type only.',
     'A table cell longer than a page (about 85 lines) is cut, and says how many characters are missing: the activity.json export has every value in full.',
 ];
@@ -75,9 +82,12 @@ function detailBody(i: TimelineItem): string {
     ].filter(Boolean).join('\n');
 }
 
+/** The time cell's marker for a row read from the email log after the event timeline began (kind `log`). */
+const FROM_LOG = 'from email log';
+
 /** The five cells of one timeline row. */
 export function rowCells(i: TimelineItem): string[] {
-    const time = utc(i.at) + (i.legacy ? '\nlegacy' : '');
+    const time = utc(i.at) + (i.legacy ? '\nlegacy' : i.kind === 'log' ? `\n${FROM_LOG}` : '');
     const event = [i.label, i.emailType ? `${i.emailType}${i.emailLogId ? ` #${i.emailLogId}` : ''}` : null, i.kind === 'event' ? `via ${i.source}` : null]
         .filter(Boolean).join('\n');
     const detail = [detailBody(i), i.actor ? `by ${i.actor}` : null].filter(Boolean).join('\n') || '—';
@@ -209,7 +219,15 @@ export function buildEvidenceReport(input: EvidenceReportInput): Buffer {
     y -= 13;
     text(M, 'Summary', 'bold', 11);
     const e = s.emails;
-    paragraph(`Emails: ${e.total} logged · ${e.sent} sent · ${e.delivered} delivered (provider-reported) · ${e.opened} opened`
+    // Emails count once each (a retried email is one email, its attempts apart); delivery only when a provider can report it.
+    const attempts = Number(e.attempts) || 0;
+    const delivery = s.deliveryEvents === false ? 'delivery not reported (no provider webhook is configured)' : `${e.delivered} delivered (provider-reported)`;
+    const pending = [
+        e.sending ? `${e.sending} sending` : null, e.retrying ? `${e.retrying} retrying` : null, e.deferred ? `${e.deferred} deferred` : null,
+        e.unknown ? `${e.unknown} no reply recorded` : null, e.failed ? `${e.failed} failed` : null, e.suppressed ? `${e.suppressed} suppressed` : null,
+    ].filter(Boolean);
+    paragraph(`Emails: ${e.total}${attempts > e.total ? ` (${attempts} attempts)` : ''} · ${e.sent} accepted by the mail server · ${delivery}`
+        + `${pending.length ? ` · ${pending.join(' · ')}` : ''} · ${e.opened} opened`
         + `${e.firstOpenAt ? ` (first open ${utc(e.firstOpenAt)} UTC)` : ''} · ${e.clicked} clicked · ${e.bounced} bounced or complained`, 'regular', 9, 12);
     paragraph(`Opens recorded: ${s.opens.recorded} — classified events: human-likely ${s.opens.human} · machine-likely ${s.opens.machine} · unknown ${s.opens.unknown}`, 'regular', 9, 12);
     paragraph(`Clicks recorded: ${s.clicks.recorded} — classified events: human-likely ${s.clicks.human} · machine-likely ${s.clicks.machine} · unknown ${s.clicks.unknown}`, 'regular', 9, 12);
@@ -257,7 +275,7 @@ export function buildEvidenceReport(input: EvidenceReportInput): Buffer {
         let x = M;
         cells.forEach((lines, idx) => {
             lines.forEach((line, li) => {
-                const color = idx === 0 && line === 'legacy' ? MUTED : (li > 0 && idx !== 2 ? MUTED : INK);
+                const color = idx === 0 && (line === 'legacy' || line === FROM_LOG) ? MUTED : (li > 0 && idx !== 2 ? MUTED : INK);
                 pdf.text(page, x + CELL_PAD, y - CELL_PAD - TABLE_SIZE - li * TABLE_LEADING + 1, line, idx === 1 && li === 0 ? 'bold' : 'regular', TABLE_SIZE, color);
             });
             x += COLS[idx].width;

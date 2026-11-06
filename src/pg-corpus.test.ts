@@ -26,6 +26,8 @@ import { batchedDelete } from './email-tracking.service';
 import { EmailEventService } from './email-event.service';
 import { applyStatusChange, nextStatus, STATUS_RANK, statusChangeForEvent } from './event-types';
 import { databaseClockSkewMinutes } from './db-clock';
+import { databaseNow } from './send-attempts';
+import { ACCEPTED_SQL, ATTEMPT_COLUMNS, NO_OUTCOME_SQL, SENDING_SQL, UNKNOWN_SQL, UNSETTLED_SQL } from './send-attempts';
 
 const PG_URL = process.env.HULO_PG_URL;
 
@@ -143,7 +145,8 @@ const DDL = [
 const SEED = [
     `INSERT INTO email_log (type, recipient, subject, "channelId", "customerId", "orderId", "orderCode", status, "smtpMessageId", "openCount", "clickCount")
      VALUES ('order-confirmation', 'a@example.com', 'Order confirmation for #ABCDEFGHIJ12', 1, 1, 1, 'ABCDEFGHIJ12', 'sent', 'msg-1@example.com', 2, 1),
-            ('password-reset', 'b@example.com', 'Reset your password', 2, NULL, NULL, NULL, 'bounced', 'msg-2@example.com', 0, 0)`,
+            ('password-reset', 'b@example.com', 'Reset your password', 2, NULL, NULL, NULL, 'bounced', 'msg-2@example.com', 0, 0),
+            ('order-confirmation', 'a@example.com', 'Order confirmation for #ABCDEFGHIJ12', 1, 1, 1, 'ABCDEFGHIJ12', 'failed', NULL, 0, 0)`,
     `INSERT INTO email_link ("emailLogId", "linkToken", "linkType", "destinationUrlHost", "expiresAt")
      VALUES (1, REPEAT('a', 64), 'order_view', 'shop.example.com', NOW() - INTERVAL '1 day')`,
     `INSERT INTO email_suppression (recipient, reason, note, "channelId") VALUES ('dead@example.com', 'hard-bounce', 'seed', 1)`,
@@ -162,7 +165,16 @@ const SEED = [
 /** Stand-in for a `${expr}` interpolation inside an SQL template literal. */
 function standIn(expr: string): string {
     const e = expr.trim();
-    if (/^(w|whereClause)$/.test(e)) return ' WHERE `customerId` = ? AND recipient LIKE ? AND `createdAt` >= ?';
+    if (/^(w|\w*Clause)$/.test(e)) return ' WHERE `customerId` = ? AND recipient LIKE ? AND `createdAt` >= ?';
+    // The shared fragments of send-attempts.ts, as they are.
+    if (/^(columns|ATTEMPT_COLUMNS)$/.test(e)) return ATTEMPT_COLUMNS;
+    if (e === 'SENDING_SQL') return SENDING_SQL;
+    if (e === 'UNKNOWN_SQL') return UNKNOWN_SQL;
+    if (e === 'UNSETTLED_SQL') return UNSETTLED_SQL;
+    if (e === 'NO_OUTCOME_SQL') return NO_OUTCOME_SQL;
+    if (e === 'ACCEPTED_SQL') return ACCEPTED_SQL;
+    // relatedAttempts: one window per recipient (two here).
+    if (e === 'windows') return '(recipient = ? AND `createdAt` >= ? AND `createdAt` <= ?) OR (recipient = ? AND `createdAt` >= ? AND `createdAt` <= ?)';
     if (/^where$/.test(e)) return '`createdAt` < DATE_SUB(NOW(), INTERVAL ? DAY)';
     if (/^table$/.test(e)) return 'email_log';
     if (/RETENTION_BATCH/.test(e)) return '5000';
@@ -222,6 +234,7 @@ function paramsFor(sql: string): any[] {
         else if (/(At`?|NOW\(\))\s*(<=|<)\s*$/.test(before)) out.push(new Date('2100-01-01T00:00:00Z'));
         else if (/(At`?|NOW\(\))\s*(=|,)\s*$/.test(before)) out.push(new Date());
         else if (/LIKE\s*$/i.test(before)) out.push('%example%');
+        else if (/\(recipient\s*=\s*$/.test(before)) out.push('a@example.com'); // relatedAttempts' windows: a seeded recipient
         else if (/(code|token|recipient|smtpMessageId`?|emailAddress`?\))\s*=\s*(LOWER\()?\s*$/i.test(before)) out.push('1');
         else out.push('1');
     }
@@ -452,6 +465,18 @@ describe.skipIf(!PG_URL)('Postgres SQL corpus (HULO_PG_URL)', () => {
         await client.query(`SET TIME ZONE '${sameZone.replace(/'/g, '')}'`);
         try {
             expect(await databaseClockSkewMinutes(query, 'postgres')).toBe(0);
+        } finally {
+            await client.query('RESET TIME ZONE');
+        }
+    }, 30_000);
+
+    it('the send windows read the database session\'s clock, as the timestamps it writes read back', async () => {
+        const db = createDbAdapter(raw);
+        const query = (sql: string, params?: any[]) => db.query(sql, params);
+        await client.query("SET TIME ZONE 'Asia/Kathmandu'"); // UTC+05:45 all year
+        try {
+            const processOffset = -new Date().getTimezoneOffset();
+            expect(Math.round((await databaseNow(query, 'postgres') - Date.now()) / 60_000)).toBe(345 - processOffset);
         } finally {
             await client.query('RESET TIME ZONE');
         }

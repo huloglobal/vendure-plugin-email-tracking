@@ -1,6 +1,6 @@
 {
     "name": "@huloglobal/vendure-plugin-email-tracking",
-    "version": "0.16.2",
+    "version": "0.16.3",
     "description": "Track every transactional email a Vendure server sends: sends, deliveries, bounces, opens and clicks as raw events, verified Postmark/SendGrid/Mailgun/SES webhooks, a per-order activity timeline with a PDF evidence report, and an admin UI.",
     "license": "AGPL-3.0-only",
     "author": "Wayne Garrison <wayne@garrison.me.uk>",

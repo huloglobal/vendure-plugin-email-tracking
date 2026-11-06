@@ -3,8 +3,8 @@ import { UntypedFormGroup } from '@angular/forms';
 import { CustomDetailComponent, NotificationService, PermissionsService, SharedModule } from '@vendure/admin-ui/core';
 import { Observable, Subscription } from 'rxjs';
 import {
-    ActivityItem, ActivityPage, classLabel, clientLabel, collapseRuns, EmailTrackingHttp, EmailTrackingTier, errorMessage, iconFor, isUnsigned,
-    locationLabel, openEvidenceReport, PanelRow, toneFor,
+    ActivityItem, ActivityPage, classLabel, clientLabel, collapseRuns, EmailTrackingHttp, EmailTrackingTier, emailsInProgress, errorMessage, iconFor,
+    isUnsigned, locationLabel, openEvidenceReport, PanelRow, toneFor,
 } from './activity-shared';
 
 /**
@@ -16,6 +16,13 @@ import {
  * order notes left out; the full page offers to include them). Hidden for
  * admins without ReadOrder and ReadCustomer; unlicensed installs see the
  * premium notice, never an error, and no premium request is made for them.
+ *
+ * Emails are counted once each (a retried email is one email): accepted by
+ * the mail server, and delivered only where a provider webhook can report
+ * it; sending, retrying, deferred, no reply recorded, failed and suppressed
+ * when there are any. Refresh reads the card again; while an email is
+ * sending or waiting for its retry the card refreshes itself every 10
+ * seconds, for up to 3 minutes.
  */
 @Component({
     selector: 'hulo-order-email-activity-panel',
@@ -29,11 +36,23 @@ import {
                 Order email activity is a premium feature —
                 <a [routerLink]="['/extensions', 'email-log']">subscribe or activate a key</a> on the Email Log page.
             </div>
-            <div *ngIf="state === 'error'" class="et-muted" role="alert">{{ error }}</div>
+            <div *ngIf="state === 'error'" class="et-muted" role="alert">
+                {{ error }}
+                <button type="button" class="btn btn-sm btn-link" (click)="refresh()">Try again</button>
+            </div>
             <ng-container *ngIf="state === 'ready' && page">
                 <div class="et-stats" *ngIf="page.summary as s">
-                    <span class="et-stat"><strong>{{ s.emails.total }}</strong> emails</span>
-                    <span class="et-stat"><strong>{{ s.emails.delivered }}</strong> delivered</span>
+                    <span class="et-stat"><strong>{{ s.emails.total }}</strong> email{{ s.emails.total === 1 ? '' : 's' }}<ng-container *ngIf="s.emails.attempts > s.emails.total"> ({{ s.emails.attempts }} attempts)</ng-container></span>
+                    <span class="et-stat" [title]="s.deliveryEvents ? 'The mail server took the email (SMTP 250)' : 'The mail server took the email (SMTP 250). Delivery to the inbox is not reported: no provider webhook is configured.'">
+                        <strong>{{ s.emails.sent }}</strong> accepted by the mail server
+                    </span>
+                    <span class="et-stat" *ngIf="s.deliveryEvents" title="Delivery reported by your mail provider's webhook"><strong>{{ s.emails.delivered }}</strong> delivered</span>
+                    <span class="et-stat et-tone-warn" *ngIf="s.emails.sending" title="No reply from the mail server yet"><strong>{{ s.emails.sending }}</strong> sending</span>
+                    <span class="et-stat et-tone-warn" *ngIf="s.emails.retrying" title="Refused for the time being: it is sent again automatically"><strong>{{ s.emails.retrying }}</strong> retrying</span>
+                    <span class="et-stat et-tone-warn" *ngIf="s.emails.deferred" title="Put off for now: by the mail server (an SMTP 4xx reply) or, after it accepted the email, by the receiving server"><strong>{{ s.emails.deferred }}</strong> deferred</span>
+                    <span class="et-stat et-tone-warn" *ngIf="s.emails.unknown" title="No reply from the mail server was ever recorded: the send was cut off, for example by a restart"><strong>{{ s.emails.unknown }}</strong> no reply recorded</span>
+                    <span class="et-stat et-tone-bad" *ngIf="s.emails.failed" title="Refused for good, or every retry failed"><strong>{{ s.emails.failed }}</strong> failed</span>
+                    <span class="et-stat" *ngIf="s.emails.suppressed" title="Not sent: the recipient is on the suppression list"><strong>{{ s.emails.suppressed }}</strong> suppressed</span>
                     <span class="et-stat" [title]="s.emails.firstOpenAt ? 'First open ' + (s.emails.firstOpenAt | localeDate:'medium') : ''">
                         <strong>{{ s.emails.opened }}</strong> opened<ng-container *ngIf="s.emails.firstOpenAt"> · first {{ s.emails.firstOpenAt | localeDate:'short' }}</ng-container>
                     </span>
@@ -52,12 +71,16 @@ import {
                         <span class="et-unsigned" *ngIf="unsigned(r.item); else classified" title="From a tracking link without a signature: anyone could produce it, so it is not counted">Unverified</span>
                         <ng-template #classified><span class="et-badge" *ngIf="r.item.classification" [ngClass]="'et-cls-' + r.item.classification">{{ cls(r.item.classification) }}</span></ng-template>
                         <span class="et-muted et-small" *ngIf="where(r.item) || client(r.item)">{{ where(r.item) }}{{ where(r.item) && client(r.item) ? ' · ' : '' }}{{ client(r.item) }}</span>
-                        <span class="et-legacy" *ngIf="r.item.legacy" title="Reconstructed from the email log (sent before 0.16.0)">legacy</span>
+                        <span class="et-legacy" *ngIf="r.item.legacy" title="Read from the email log: sent before the event timeline began (0.16.0)">legacy</span>
                     </li>
                 </ol>
                 <ng-template #emptyTpl><p class="et-muted">No email activity for this order yet.</p></ng-template>
                 <p class="et-muted et-small" *ngIf="rows.length">Locations are IP-derived and approximate (mail proxies, VPNs, scanners).</p>
+                <p class="et-muted et-small" *ngIf="polling" role="status">Updating every 10 seconds while an email is being sent or retried.</p>
                 <div class="et-actions">
+                    <button type="button" class="btn btn-sm btn-secondary" (click)="refresh()" [disabled]="refreshing" title="Read the email activity again">
+                        <clr-icon shape="refresh" aria-hidden="true"></clr-icon> {{ refreshing ? 'Refreshing…' : 'Refresh' }}
+                    </button>
                     <a class="btn btn-sm btn-secondary" [routerLink]="['/extensions', 'email-log', 'orders', orderId]">Open full activity</a>
                     <button type="button" class="btn btn-sm btn-secondary" (click)="evidence()" title="Private order notes are left out; Open full activity offers to include them">
                         <clr-icon shape="file" aria-hidden="true"></clr-icon> Evidence report (PDF)
@@ -106,9 +129,19 @@ export class OrderEmailActivityPanelComponent implements CustomDetailComponent, 
     rows: PanelRow[] = [];
     /** The last row, when its run of identical opens may go on past what was fetched ("× 400+"). */
     openEnded: PanelRow | null = null;
-    private fetched: ActivityItem[] = [];
     /** Pages of 100 the panel reads at most to fill its ten rows. */
     private static readonly MAX_PAGES = 4;
+    /** While an email is sending or retrying: refresh every 10 s, for up to 3 minutes from the load or the last Refresh. */
+    private static readonly POLL_EVERY_MS = 10_000;
+    private static readonly POLL_FOR_MS = 3 * 60_000;
+    private pollTimer: ReturnType<typeof setTimeout> | null = null;
+    private pollUntil = 0;
+    /** The card refreshes itself (the note under the rows); it stays on while a poll's request is out. */
+    polling = false;
+    /** A refresh is reading the card again (what is shown stays until it answers). */
+    refreshing = false;
+    /** The refresh in flight was the poll's: its failure stops the polling without a message. */
+    private quietRefresh = false;
     state: 'loading' | 'ready' | 'locked' | 'error' = 'loading';
     error = '';
     /** The endpoints need ReadOrder AND ReadCustomer; without both the panel is not shown at all. */
@@ -145,12 +178,14 @@ export class OrderEmailActivityPanelComponent implements CustomDetailComponent, 
         });
     }
 
-    ngOnDestroy() { this.sub?.unsubscribe(); this.permSub?.unsubscribe(); }
+    ngOnDestroy() { this.sub?.unsubscribe(); this.permSub?.unsubscribe(); this.stopPolling(); }
 
     load() {
         if (!this.orderId) return;
+        this.stopPolling();
+        this.pollUntil = 0;
+        this.refreshing = false;
         this.state = 'loading';
-        this.fetched = [];
         this.cdr.markForCheck();
         // Unlicensed: the notice, without a premium request (and its 402) being made.
         this.tier.premium$().subscribe(premium => {
@@ -159,36 +194,97 @@ export class OrderEmailActivityPanelComponent implements CustomDetailComponent, 
                 this.cdr.markForCheck();
                 return;
             }
-            this.fetchPage(null, 1);
+            this.fetchPage(null, 1, [], null);
         });
+    }
+
+    /**
+     * Read the card again, keeping what is shown until the answer comes (the
+     * Refresh button: also a new 3-minute polling window; `manual` false: the
+     * poll). From an error or the premium notice it loads the card afresh.
+     */
+    refresh(manual = true) {
+        if (!this.orderId) return;
+        if (manual) this.pollUntil = 0;
+        if (this.state !== 'ready') { this.load(); return; }
+        if (this.refreshing) return;
+        this.clearPollTimer();
+        this.refreshing = true;
+        this.quietRefresh = !manual;
+        this.cdr.markForCheck();
+        this.fetchPage(null, 1, [], null);
+    }
+
+    /** While an email is sending or retrying, the next refresh in 10 s — until 3 minutes have passed. */
+    private schedulePoll() {
+        this.clearPollTimer();
+        if (!emailsInProgress(this.page?.summary)) { this.pollUntil = 0; this.polling = false; return; }
+        const now = Date.now();
+        if (!this.pollUntil) this.pollUntil = now + OrderEmailActivityPanelComponent.POLL_FOR_MS;
+        this.polling = now < this.pollUntil;
+        if (!this.polling) return;
+        this.pollTimer = setTimeout(() => {
+            this.pollTimer = null;
+            this.refresh(false);
+        }, OrderEmailActivityPanelComponent.POLL_EVERY_MS);
+    }
+
+    /** Cancel the next poll (the note stays: a refresh is about to answer). */
+    private clearPollTimer() {
+        if (this.pollTimer !== null) clearTimeout(this.pollTimer);
+        this.pollTimer = null;
+    }
+
+    /** No more polling: a failed refresh, the premium notice, a reload, the card gone. */
+    private stopPolling() {
+        this.clearPollTimer();
+        this.polling = false;
     }
 
     /**
      * The latest items, newest first, folded to ten rows (identical proxy opens become one).
      * When a long run of opens fills a page, the next page is read too — at most MAX_PAGES.
+     * `acc`: the items read so far; `first`: the first page (it carries the summary).
      */
-    private fetchPage(cursor: string | null, n: number) {
+    private fetchPage(cursor: string | null, n: number, acc: ActivityItem[], first: ActivityPage | null) {
+        const forOrder = this.orderId;
         const id = encodeURIComponent(this.orderId || '');
         const url = `/email-track/orders/${id}/activity?take=100&order=desc${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''}`;
         this.http.get<ActivityPage>(url).subscribe({
             next: p => {
-                if (!cursor) this.page = p; // the summary comes with the first page
-                this.fetched.push(...(p.items || []));
+                if (this.orderId !== forOrder) return; // another order is shown now
+                const head = first || p; // the summary comes with the first page
+                const fetched = [...acc, ...(p.items || [])];
                 // An eleventh row proves the tenth is complete.
-                const rows = collapseRuns(this.fetched, 11);
+                const rows = collapseRuns(fetched, 11);
                 if (rows.length <= 10 && p.hasMore && p.nextCursor && n < OrderEmailActivityPanelComponent.MAX_PAGES) {
-                    this.fetchPage(p.nextCursor, n + 1);
+                    this.fetchPage(p.nextCursor, n + 1, fetched, head);
                     return;
                 }
+                this.page = head;
                 this.rows = rows.slice(0, 10);
                 const last = this.rows[this.rows.length - 1] || null;
                 this.openEnded = rows.length <= 10 && p.hasMore && last && last.count > 1 ? last : null;
                 this.state = 'ready';
+                this.refreshing = false;
+                this.schedulePoll();
                 this.cdr.markForCheck();
             },
             error: e => {
-                if (e?.status === 402) this.state = 'locked';
-                else { this.state = 'error'; this.error = errorMessage(e, 'Loading email activity'); }
+                if (this.orderId !== forOrder) return;
+                const wasRefresh = this.refreshing;
+                this.refreshing = false;
+                if (wasRefresh && e?.status !== 402) {
+                    // A failed refresh keeps the card as it was; only a Refresh click says so.
+                    this.stopPolling();
+                    if (!this.quietRefresh) this.notify.error(errorMessage(e, 'Refreshing email activity'));
+                } else if (e?.status === 402) {
+                    this.stopPolling();
+                    this.state = 'locked';
+                } else {
+                    this.state = 'error';
+                    this.error = errorMessage(e, 'Loading email activity');
+                }
                 this.cdr.markForCheck();
             },
         });

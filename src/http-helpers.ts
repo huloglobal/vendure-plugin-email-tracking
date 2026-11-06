@@ -1,7 +1,8 @@
 import { Permission, RequestContext } from '@vendure/core';
 import { applySecurityHeaders, RateLimiter } from '@huloglobal/vendure-licence-sdk';
 import { Request, Response } from 'express';
-import { getOptions, ProviderWebhookOptions } from './options';
+import { PROVIDER_SLUGS } from './event-types';
+import { getOptions, hasPremiumAccess, ProviderWebhookOptions } from './options';
 import { getRealIp } from './proxy-headers';
 
 /** Process-wide rate limiter shared by the public endpoints (open, click,
@@ -107,6 +108,21 @@ export function providerConfigured(slug: string, cfg: ProviderWebhookOptions | u
         case 'ses': return Array.isArray(c.ses?.topicArns) && c.ses!.topicArns.some(Boolean);
         default: return false;
     }
+}
+
+/**
+ * Why deliveries cannot be reported: no provider webhook is configured, or
+ * the free tier, which does not record a provider's `delivered` events
+ * (FREE_PROVIDER_TYPES). Null: they can be.
+ */
+export function deliveryEventsUnavailable(cfg: ProviderWebhookOptions | undefined = getOptions().providerWebhooks): 'no-webhook' | 'free-tier' | null {
+    if (!PROVIDER_SLUGS.some(slug => providerConfigured(slug, cfg))) return 'no-webhook';
+    return hasPremiumAccess() ? null : 'free-tier';
+}
+
+/** Deliveries can be reported: a provider webhook is configured and its delivery events are recorded. Without that, `delivered` is never known. */
+export function deliveryEventsConfigured(cfg: ProviderWebhookOptions | undefined = getOptions().providerWebhooks): boolean {
+    return deliveryEventsUnavailable(cfg) === null;
 }
 
 /** Bounded integer from a query/body value; null when it is not one. */

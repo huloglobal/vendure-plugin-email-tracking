@@ -5,6 +5,119 @@ documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) and this project
 adheres to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.16.3] — 2026-11-06
+
+Honest email outcomes on the order card and in the Email Log. No schema
+change and no stored status is rewritten: every view now reads a send
+attempt together with the other attempts of the same email (README → Send
+attempts).
+
+### Fixed
+- **The order card said "N delivered" where nothing can report a
+  delivery.** Only a provider webhook ever sets `delivered`, so a shop
+  sending through plain SMTP (Gmail, for one) always read "0 delivered". The
+  "Email activity" card and the activity page now count emails **accepted
+  by the mail server**, and show "delivered" only when a provider webhook is
+  configured and its deliveries are recorded (not on the free tier;
+  `summary.deliveryEvents` on
+  `GET /email-track/orders/:orderId/activity`). The evidence PDF says
+  "accepted by the mail server" and "delivery not reported (no provider
+  webhook is configured)".
+- **An email still being sent looked sent.** Its `email_log` row is written
+  before SMTP starts, as `sent`. Until the reply or the error is recorded
+  (and for at most 15 minutes) it now reads **"Sending…"**: on the order
+  card and timeline, in the exports and the PDF, and as state `sending` in
+  the Email Log, whose Sent card no longer counts it (nor do By template and
+  the weekly figures). When nodemailer's reply cannot be captured, the
+  sender records an empty one, so a finished send never reads as sending.
+  A send that still has no reply after 15 minutes was cut off (for example
+  by a worker restart mid-SMTP): it reads **"No reply recorded"** (state
+  `unknown`) and is not counted as sent. When the send job runs it again,
+  the two attempts are linked like a retry ("No reply recorded, retried",
+  then "Sent after 1 retry"). Rows from before the event timeline began
+  (no reply was recorded before 0.14.3) keep their stored status.
+- **The "legacy" badge ("sent before 0.16.0") appeared on emails sent after
+  the upgrade**: on any email without a send event yet. Only emails created
+  before the install's first send event are legacy now; a later one without
+  a send event is read from the email log as kind `log`, without the badge.
+- **A temporary refusal read as a red "Send failed", and its retry as an
+  unrelated email.** An SMTP 4xx reply and a connection or timeout error are
+  temporary: the attempt reads **"Deferred, retrying"** while Vendure's send
+  job can retry it, and the next attempt of the same email (same channel,
+  order, type, recipient and subject, created within 15 minutes of the
+  failure) is linked to it: "Deferred, retried" (`retriedBy`, "retried as
+  email #…" in the detail) and **"Sent after 1 retry"** (`retryOf`). "Send
+  failed" now means a permanent refusal (SMTP 5xx or any other error) with
+  no later attempt, or that the retries are over (no new attempt within 15
+  minutes, or the sixth attempt failed: "Send failed after 5 retries"). The
+  card counts each email once ("1 email (2 attempts)"), with sending,
+  retrying, deferred, no reply recorded, failed and suppressed figures when
+  there are any.
+- **Email Log: the Failed card and the list it opened disagreed** (the card
+  counted the last 30 days, the list every email ever: 1 against 127 on one
+  shop), **and By template counted failed attempts as sent.** The cards and
+  the list now share one period and filter set (a new period choice: 7, 30,
+  90 or 365 days, or all time; all time when opened for a customer or an
+  order), and each card opens exactly the emails it counts. Failed counts
+  emails that failed for good; new **In progress** (sending, or waiting for
+  a retry) and **Retried** (refused attempts that were sent again) cards,
+  and a **No reply** card when there are any; Sent leaves out sends in
+  flight and those without a reply; Delivered says "not reported" without a
+  provider webhook, and "not recorded on the free tier" there. By
+  template's **Sent** counts the emails the mail server accepted, including
+  those that later bounced, were deferred or drew a complaint (the open and
+  click rates are over them), and **Failed** the emails that failed for
+  good, in the admin GraphQL `huloEmailStatsByTemplate` too. A search by
+  recipient, type, customer or order keeps the chosen period and says so
+  ("Searching the last 30 days", with **Search all time**). Every refused
+  attempt in the period is read with its retry, newest first, so a long
+  period ("Last 365 days", "All time") counts a retried email as retried
+  however many were refused before it.
+- **The sending and retry windows ran on this process's clock** while the
+  timestamps they compare with are written by the database. They now use
+  the database's own time (`LOCALTIMESTAMP` on MySQL, MariaDB and
+  PostgreSQL), so a database in another time zone no longer turns a send in
+  flight into a sent one or a temporary refusal into a failure; the Email
+  Log period and By template count back from it too.
+- **SES: every send was stored as failed.** The SES transport's reply is
+  the message id (`0100018b…`), which was read as reply code 100018. A
+  reply without an SMTP reply code is now sent, in `TrackingEmailSender`
+  and `sendTracked`. Rows stored before 0.16.3 keep their `failed` status.
+- "Emails tracked" in the weekly report, the dashboard widget, the licence
+  banner and the usage stats counts the emails the mail server accepted;
+  refused, suppressed and in-flight attempts were counted, which also
+  lowered the open rate. The figure is lower than an earlier version's for
+  the same emails; the heartbeat and evaluation stats carry the plugin
+  version, which tells the two apart (no stats key was added: the licence
+  server lists every key in its e-mails).
+
+### Added
+- **Refresh** on the order card, which also refreshes itself every 10
+  seconds, for up to 3 minutes, while an email is sending or waiting for
+  its retry (a failed refresh keeps what is shown).
+- `GET /email-track/log` and `log/export.csv`: `state=` (one or several of
+  sending, sent, delivered, deferred, bounced, complained, suppressed,
+  retrying, retried, failed, unknown) and `fromDays=` (days, or `all`).
+  List rows carry `state`, `attempt`, `retryOf` and `retriedBy`; the CSV
+  export ends with a `state` column. `status=` still filters the stored
+  status.
+- `GET /email-track/log/summary` takes the list's filters (`recipient`,
+  `type`, `customerId`, `orderCode`, `fromDays` — default 30, or `all`) and
+  returns `sending`, `retrying`, `retried`, `unknown`, `deliveryEvents` and
+  `deliveryEventsReason` (`no-webhook` or `free-tier` when deliveries
+  cannot be reported); `failed` and `deferred` count what was not retried,
+  and `total` still counts every row. The period is bound as a date, as the
+  list binds it.
+- Order activity: `summary.emails` has `attempts`, `sending`, `retrying`,
+  `deferred`, `unknown`, `failed` and `suppressed`, and `total` and `sent`
+  count emails (a retried one once); the card and the activity page show
+  the non-zero ones. `deliveryEvents` is false on the free tier, which does
+  not record a provider's deliveries. Send items have `sendState`, `retryOf`
+  and `retriedBy`. The evidence report's timeline SHA-256 covers them, so it
+  differs from a 0.16.2 export of the same timeline. The PDF marks rows
+  read from the email log after the event timeline began ("from email
+  log") and explains "Sending…", "No reply recorded" and the retry labels.
+
 ## [0.16.2] — 2026-11-05
 
 ### Package metadata

@@ -6,6 +6,7 @@ vi.mock('./email-log.entity', () => ({ EmailLog: class EmailLog {} }));
 import { CapturingSender, TrackingEmailSender, statusFromSmtpResponse } from './tracking-email-sender';
 import { setOptions } from './options';
 import { verifyClickSignature } from './click-signature';
+import { attemptStates } from './send-attempts';
 
 describe('CapturingSender', () => {
     it('keeps nodemailer info on the EmailDetails of that send only', async () => {
@@ -23,7 +24,11 @@ describe('CapturingSender', () => {
         expect(statusFromSmtpResponse('250 2.0.0 OK')).toBe('sent');
         expect(statusFromSmtpResponse('450 4.2.1 try later')).toBe('deferred');
         expect(statusFromSmtpResponse('550 5.1.1 no such user')).toBe('failed');
+        expect(statusFromSmtpResponse('421-4.3.0 Temporary System Problem')).toBe('deferred');
         expect(statusFromSmtpResponse(undefined)).toBe('sent');
+        // A reply without a code is not a refusal: the SES transport answers with the message id (it read as code 100018, failed).
+        expect(statusFromSmtpResponse('0100018b9c3f5a4e-6d1f2a3b-4c5d-4e6f-8a9b-0c1d2e3f4a5b-000000')).toBe('sent');
+        expect(statusFromSmtpResponse('Messages queued for delivery')).toBe('sent');
     });
 });
 
@@ -163,6 +168,31 @@ describe('TrackingEmailSender 0.16.0: outcome events and correlation headers', (
         expect(JSON.parse(smtpapi).unique_args['hulo-log-id']).toMatch(/^11-[0-9a-f]{16}$/);
         expect(JSON.parse(/^X-Mailgun-Variables: (.*)$/m.exec(unfolded)![1].trim())['hulo-log-id']).toMatch(/^11-[0-9a-f]{16}$/);
         expect(/^X-Pm-Metadata-Hulo-Log-ID: (\S+)/mi.exec(unfolded)![1]).toMatch(/^11-[0-9a-f]{16}$/);
+    });
+
+    it('the row is written before SMTP starts and reads as sending until the reply is recorded; no reply captured is recorded as an empty one', async () => {
+        setOptions({ publicBaseUrl: 'https://shop.example.com', signingSecret: 'test-secret' });
+        const saved: any[] = [];
+        const updates: any[] = [];
+        const repo = {
+            create: (p: any) => ({ ...p }),
+            save: async (row: any) => { const r = { ...row, id: 13, createdAt: new Date() }; saved.push(r); return r; },
+            update: async (id: number, patch: any) => { updates.push({ id, patch }); return { affected: 1 }; },
+        };
+        const recorded: any[] = [];
+        const sender = new TrackingEmailSender();
+        (sender as any).connection = { rawConnection: { options: { type: 'mysql' }, query: async () => [], getRepository: () => repo } };
+        (sender as any).events = { record: async (e: any) => { recorded.push(e); return { id: 1, duplicate: false, failed: false }; } };
+        let during: string | undefined;
+        // A transport whose reply could not be captured; the row as it stands while SMTP runs.
+        (sender as any).inner.send = async () => { during = attemptStates([saved[0]]).get(13)?.state; };
+        await sender.send({ recipient: 'n@example.com', subject: 'Receipt', body: '<p>x</p>', from: 'f@x' } as any, { type: 'smtp' } as any);
+        expect(saved[0]).toMatchObject({ status: 'sent' });
+        expect(saved[0].smtpResponse).toBeUndefined();
+        expect(during).toBe('sending');
+        expect(updates).toEqual([{ id: 13, patch: { smtpResponse: '' } }]);
+        expect(recorded[0]).toMatchObject({ type: 'sent', source: 'smtp' });
+        expect(attemptStates([{ ...saved[0], ...updates[0].patch }]).get(13)).toMatchObject({ state: 'sent', accepted: true });
     });
 
     it('records a failed send and still throws the SMTP error', async () => {

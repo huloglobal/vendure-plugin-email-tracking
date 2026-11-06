@@ -1,7 +1,7 @@
 import { ChangeDetectionStrategy, ChangeDetectorRef, Component, OnInit } from '@angular/core';
 import { ActivatedRoute } from '@angular/router';
 import { SharedModule } from '@vendure/admin-ui/core';
-import { EmailTrackingHttp, errorMessage } from './activity-shared';
+import { EmailTrackingHttp, errorMessage, stateLabel } from './activity-shared';
 
 interface EmailRow {
     id: number;
@@ -14,6 +14,10 @@ interface EmailRow {
     openCount: number;
     firstOpenedAt: string | null;
     clickCount: number;
+    /** How the send went (sending, retrying, retried, failed, unknown — no reply recorded —, or the status), read with the email's other attempts. */
+    state?: string | null;
+    retryOf?: number | null;
+    retriedBy?: number | null;
 }
 
 /**
@@ -62,7 +66,11 @@ interface EmailRow {
                                     <ng-template #noOrder><span class="et-muted">—</span></ng-template>
                                 </td>
                                 <td class="et-subject" [title]="r.subject">{{ r.subject }}</td>
-                                <td><span class="et-status" [ngClass]="'et-status-' + r.status">{{ r.status }}</span></td>
+                                <td>
+                                    <span class="et-status" [ngClass]="'et-status-' + (r.state || r.status)">{{ stateText(r.state || r.status) }}</span>
+                                    <div class="et-muted et-small" *ngIf="r.retryOf">retry of #{{ r.retryOf }}</div>
+                                    <div class="et-muted et-small" *ngIf="r.retriedBy">retried as #{{ r.retriedBy }}</div>
+                                </td>
                                 <td>{{ r.openCount }}<div class="et-muted et-small" *ngIf="r.firstOpenedAt">{{ r.firstOpenedAt | localeDate:'short' }}</div></td>
                                 <td>{{ r.clickCount }}</td>
                             </tr>
@@ -95,6 +103,9 @@ interface EmailRow {
         .et-status-deferred { background: #b45309; }
         .et-status-bounced { background: #7e22ce; }
         .et-status-complained { background: #be185d; }
+        .et-status-retrying { background: #b45309; }
+        .et-status-retried { background: #92400e; }
+        .et-status-unknown { background: #a16207; }
         .et-pager { display: flex; justify-content: flex-end; align-items: center; gap: 10px; padding-top: 10px; }
     `],
 })
@@ -106,6 +117,7 @@ export class CustomerEmailsTabComponent implements OnInit {
     skip = 0;
     loading = false;
     error = '';
+    readonly stateText = stateLabel;
 
     constructor(private http: EmailTrackingHttp, private route: ActivatedRoute, private cdr: ChangeDetectorRef) {}
 

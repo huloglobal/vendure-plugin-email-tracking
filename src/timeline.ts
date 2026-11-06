@@ -2,10 +2,12 @@ import { createHash } from 'crypto';
 import { classifyEmailEvent } from '@huloglobal/vendure-licence-sdk';
 import { EVENT_LABELS, EmailEventType } from './event-types';
 import { redactSensitiveUrl } from './link-meta';
+import { AttemptInfo, AttemptState, retriesText } from './send-attempts';
 
 /**
  * The order activity timeline: pure builders that turn `email_event` rows,
- * legacy `email_log` rows (emails sent before 0.16.0) and Vendure's order
+ * items read from `email_log` rows (emails sent before 0.16.0, marked
+ * legacy, and sends still in flight or cut off) and Vendure's order
  * history into one chronologically sortable list, plus the filter, cursor
  * and canonical-hash helpers. No database access here.
  */
@@ -13,7 +15,9 @@ import { redactSensitiveUrl } from './link-meta';
 export type TimelineFilter = 'all' | 'emails' | 'opens' | 'clicks' | 'delivery' | 'order' | 'notes';
 export const TIMELINE_FILTERS: readonly TimelineFilter[] = ['all', 'emails', 'opens', 'clicks', 'delivery', 'order', 'notes'];
 
-export type TimelineKind = 'event' | 'legacy' | 'history';
+/** `legacy`: read from an `email_log` row sent before the event timeline; `log`: read from a later row that has no
+ *  send event (yet), e.g. a send still in flight or one cut off before its reply. */
+export type TimelineKind = 'event' | 'legacy' | 'log' | 'history';
 
 export interface TimelineLocation { country: string | null; region: string | null; city: string | null; timezone: string | null; }
 export interface TimelineNetwork {
@@ -23,7 +27,7 @@ export interface TimelineNetwork {
 }
 
 export interface TimelineItem {
-    /** Stable id: `e<eventId>`, `l<emailLogId>-…` (legacy), `h<historyId>`. */
+    /** Stable id: `e<eventId>`, `l<emailLogId>-…` (read from email_log), `h<historyId>`. */
     id: string;
     /** ISO 8601, UTC. */
     at: string;
@@ -53,12 +57,18 @@ export interface TimelineItem {
     legacy: boolean;
     /** Order notes only: Vendure's public (customer-visible) or private (internal) note. */
     visibility?: 'public' | 'private';
+    /** Send items only (0.16.3): how the attempt ended, read with the email's other attempts (send-attempts.ts). */
+    sendState?: AttemptState;
+    /** Send items only: the email_log id of the attempt this one retried. */
+    retryOf?: number | null;
+    /** Send items only: the email_log id of the later attempt that retried this one. */
+    retriedBy?: number | null;
     /** Full export only: every stored column, payloads and full user agents. */
     full?: Record<string, unknown>;
 }
 
 /** Sort rank per kind, so items at the same millisecond keep a stable order. */
-const RANK: Record<TimelineKind, number> = { history: 0, legacy: 1, event: 2 };
+const RANK: Record<TimelineKind, number> = { history: 0, legacy: 1, log: 1, event: 2 };
 
 export interface SortKey { t: number; r: number; k: string; }
 
@@ -242,7 +252,7 @@ export function linkLabel(linkIndex: number | null | undefined, linkText: string
     return text || null;
 }
 
-// ── Legacy email_log rows (sent before 0.16.0) ───────────────────────────
+// ── Items read from email_log rows ───────────────────────────────────────
 
 /** Per-email facts from `email_event`, used to decide what to synthesise. */
 export interface LogEventStats {
@@ -261,29 +271,84 @@ export function isUnsignedItem(item: Pick<TimelineItem, 'reasons'> & { classific
 
 const LEGACY_NOTE = 'recorded before 0.16.0';
 
+/** Item types that tell how a send attempt went: the `smtp` outcome events and the send row read from email_log. */
+const SEND_ITEM_TYPES = new Set(['sent', 'failed', 'deferred', 'sending', 'unknown']);
+
 /**
- * Items synthesised from one `email_log` row and its `opensJson` /
- * `clicksJson` (the last 50 of each), marked `legacy`. Entries at or after
- * the email's first `email_event` row are skipped — those are on the
- * timeline already as events.
+ * The label of a send item once its attempt is known (send-attempts.ts):
+ * "Sending…", "No reply recorded", "Email sent" / "Sent after 1 retry",
+ * "Deferred, retrying", "Deferred, retried", "Send failed, retried", "No
+ * reply recorded, retried", "Send failed" / "Send failed after 5 retries";
+ * otherwise the event label.
  */
-export function legacyItems(log: any, stats: LogEventStats | undefined, full: boolean): TimelineItem[] {
+export function sendLabel(type: string, info: AttemptInfo): string {
+    const retries = info.attempt - 1;
+    if (info.state === 'sending') return 'Sending…';
+    if (type === 'sent') return retries > 0 ? `Sent after ${retriesText(retries)}` : EVENT_LABELS.sent;
+    switch (info.state) {
+        case 'unknown': return 'No reply recorded';
+        case 'retrying': return 'Deferred, retrying';
+        case 'retried': return info.outcome === 'unknown' ? 'No reply recorded, retried' : info.temporary ? 'Deferred, retried' : 'Send failed, retried';
+        case 'failed': return retries > 0 ? `Send failed after ${retriesText(retries)}` : EVENT_LABELS.failed;
+        default: return EVENT_LABELS[type as EmailEventType] || type;
+    }
+}
+
+/**
+ * A send item (an `smtp` sent / failed / deferred event, or the send row read
+ * from email_log) told with how its attempt ended: the label, `sendState`,
+ * and the link to the attempt it retried or that retried it (also in the
+ * detail, so the exports and the PDF carry it). Other items are unchanged.
+ */
+export function withAttempt(item: TimelineItem, info: AttemptInfo | undefined): TimelineItem {
+    if (!info || !SEND_ITEM_TYPES.has(item.type) || (item.kind === 'event' && item.source !== 'smtp')) return item;
+    const links = [
+        info.retryOf !== null ? `retry of email #${info.retryOf}` : null,
+        info.retriedBy !== null ? `retried as email #${info.retriedBy}` : null,
+    ];
+    return {
+        ...item,
+        label: sendLabel(item.type, info),
+        detail: [item.detail, ...links].filter(Boolean).join(' — ') || null,
+        sendState: item.type === 'sent' ? 'sent' : info.state,
+        retryOf: info.retryOf,
+        retriedBy: info.retriedBy,
+    };
+}
+
+/**
+ * Items read from one `email_log` row and its `opensJson` / `clicksJson`
+ * (the last 50 of each): the send, when the row has no send event (yet),
+ * and entries before the email's first `email_event` row — later ones are on
+ * the timeline already as events. `legacy` (default true): the row predates
+ * the event timeline, so the items are kind `legacy` and marked legacy;
+ * otherwise kind `log`. `attempt`: how the send went (send-attempts.ts) — a
+ * send still in flight reads "Sending…", one that never recorded a reply "No
+ * reply recorded", never "Email sent".
+ */
+export function legacyItems(log: any, stats: LogEventStats | undefined, full: boolean, opts: { legacy?: boolean; attempt?: AttemptInfo } = {}): TimelineItem[] {
     const out: TimelineItem[] = [];
     const id = Number(log.id);
+    const isLegacy = opts.legacy !== false;
     const cutoff = stats?.firstAt ? Date.parse(stats.firstAt) : Infinity;
     const email: EmailInfo = { id, type: log.type ?? null, subject: log.subject ?? null };
     const base = (suffix: string, at: string, type: string, label: string, detail: string | null): TimelineItem => ({
-        id: `l${id}-${suffix}`, at, kind: 'legacy', type, source: 'email_log', label, detail,
+        id: `l${id}-${suffix}`, at, kind: isLegacy ? 'legacy' : 'log', type, source: 'email_log', label, detail,
         emailLogId: id, emailType: email.type, classification: null, reasons: [], location: null, network: null,
-        client: null, platform: null, isBot: null, ip: null, url: null, linkIndex: null, linkText: null, actor: null, legacy: true,
+        client: null, platform: null, isBot: null, ip: null, url: null, linkIndex: null, linkText: null, actor: null, legacy: isLegacy,
     });
     const createdAt = toIso(log.createdAt);
     const status = String(log.status || 'sent');
     if (!stats?.hasSend && createdAt) {
-        const type = status === 'failed' || status === 'suppressed' ? status : 'sent';
-        const detail = [log.subject ? `“${String(log.subject).slice(0, 160)}”` : null, log.smtpResponse || (type !== 'sent' ? log.errorMessage : null)]
-            .filter(Boolean).join(' — ') || null;
-        const it = base('s', createdAt, type, EVENT_LABELS[type as EmailEventType], detail);
+        const sending = opts.attempt?.state === 'sending';
+        const noReply = opts.attempt?.outcome === 'unknown';
+        const type = sending ? 'sending' : noReply ? 'unknown' : status === 'failed' || status === 'suppressed' ? status : 'sent';
+        const reply = sending ? 'no reply from the mail server yet'
+            : noReply ? 'no reply from the mail server was recorded'
+                : log.smtpResponse || (type !== 'sent' ? log.errorMessage : null);
+        const detail = [log.subject ? `“${String(log.subject).slice(0, 160)}”` : null, reply].filter(Boolean).join(' — ') || null;
+        const label = EVENT_LABELS[type as EmailEventType] || (noReply ? 'No reply recorded' : 'Sending…');
+        const it = withAttempt(base('s', createdAt, type, label, detail), opts.attempt);
         if (full) it.full = { emailLog: legacyLogColumns(log) };
         out.push(it);
     }
@@ -294,7 +359,7 @@ export function legacyItems(log: any, stats: LogEventStats | undefined, full: bo
     // never changes — and says so.
     if (!stats?.hasSend && !stats?.hasStatus && ['bounced', 'complained', 'deferred', 'delivered'].includes(status) && createdAt) {
         out.push(base('st', createdAt, status, EVENT_LABELS[status as EmailEventType],
-            [log.errorMessage, `status ${LEGACY_NOTE} (time not recorded; shown at the send time)`].filter(Boolean).join(' — ')));
+            [log.errorMessage, `status ${isLegacy ? LEGACY_NOTE : 'from the email log'} (time not recorded; shown at the send time)`].filter(Boolean).join(' — ')));
     }
     const opens = Array.isArray(parseJson(log.opensJson)) ? parseJson(log.opensJson) : [];
     opens.forEach((o: any, i: number) => {

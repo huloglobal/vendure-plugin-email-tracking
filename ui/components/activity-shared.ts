@@ -81,11 +81,15 @@ export class EmailTrackingTier {
     reset(): void { this.cached = null; }
 }
 
+/** How a send attempt went (the server's send-attempts.ts; `unknown`: no reply was ever recorded). */
+export type SendState = 'sending' | 'sent' | 'delivered' | 'deferred' | 'bounced' | 'complained' | 'suppressed' | 'retrying' | 'retried' | 'failed' | 'unknown';
+
 /** One timeline item as `GET /email-track/orders/:orderId/activity` returns it (redacted). */
 export interface ActivityItem {
     id: string;
     at: string;
-    kind: 'event' | 'legacy' | 'history';
+    /** `legacy`: read from an email log row sent before the event timeline; `log`: from a later row without a send event (yet). */
+    kind: 'event' | 'legacy' | 'log' | 'history';
     type: string;
     source: string;
     label: string;
@@ -106,14 +110,29 @@ export interface ActivityItem {
     actor: string | null;
     legacy: boolean;
     visibility?: 'public' | 'private';
+    /** Send items only: how the attempt went, read with the email's other attempts. */
+    sendState?: SendState;
+    /** Send items only: the email log id of the attempt this one retried. */
+    retryOf?: number | null;
+    /** Send items only: the email log id of the later attempt that retried this one. */
+    retriedBy?: number | null;
 }
 
 export interface ActivitySummary {
     order: { id: number; code: string; state: string; placedAt: string | null; totalFormatted: string; paymentState: string; customerEmail: string | null; customerName: string | null };
-    emails: { total: number; sent: number; delivered: number; opened: number; firstOpenAt: string | null; clicked: number; bounced: number };
+    /**
+     * Per email (a retried email counts once): `sent` accepted by the mail server, `delivered` reported by a provider webhook,
+     * `unknown` no reply ever recorded (the send was cut off).
+     */
+    emails: {
+        total: number; attempts: number; sent: number; delivered: number; sending: number; retrying: number; deferred: number; unknown: number;
+        failed: number; suppressed: number; opened: number; firstOpenAt: string | null; clicked: number; bounced: number;
+    };
     opens: { recorded: number; human: number; machine: number; unknown: number; unsigned?: number };
     clicks: { recorded: number; human: number; machine: number; unknown: number; unsigned?: number };
     historyUnavailable?: boolean;
+    /** Deliveries can be reported (a provider webhook is configured and its delivery events recorded); else `emails.delivered` stays 0. */
+    deliveryEvents?: boolean;
 }
 
 export interface ActivityPage {
@@ -189,6 +208,9 @@ export function iconFor(i: ActivityItem): string {
         if (i.type.startsWith('ORDER_FULFILLMENT')) return 'truck';
         return 'shopping-cart';
     }
+    if (i.sendState === 'sending' || i.sendState === 'retrying') return 'clock';
+    if (i.sendState === 'retried') return 'refresh';
+    if (i.sendState === 'unknown') return 'exclamation-circle';
     switch (i.type) {
         case 'open': return 'eye';
         case 'click': return 'cursor-hand-click';
@@ -203,8 +225,10 @@ export function iconFor(i: ActivityItem): string {
     }
 }
 
-/** Severity class for the event label. */
+/** Severity class for the event label: a refusal that is being or was retried, or a send without a reply, is a warning, not a failure. */
 export function toneFor(i: ActivityItem): string {
+    if (i.sendState === 'retrying' || i.sendState === 'retried' || i.sendState === 'unknown') return 'et-tone-warn';
+    if (i.sendState === 'sending') return '';
     if (['bounced', 'complained', 'dropped', 'failed', 'suppressed'].includes(i.type)) return 'et-tone-bad';
     if (['deferred', 'soft-bounce', 'unsubscribed'].includes(i.type)) return 'et-tone-warn';
     if (i.type === 'delivered') return 'et-tone-good';
@@ -249,6 +273,16 @@ export function openEvidenceReport(http: EmailTrackingHttp, orderId: number | st
             onError(errorMessage(e, 'The evidence report'));
         },
     });
+}
+
+/** A send state or stored status as a list shows it (`unknown` is "no reply": none was ever recorded). */
+export function stateLabel(state: string | null | undefined): string {
+    return state === 'unknown' ? 'no reply' : state || '';
+}
+
+/** True while an email of the order has no reply from the mail server yet, or waits for its retry. */
+export function emailsInProgress(s: ActivitySummary | null | undefined): boolean {
+    return !!s && ((Number(s.emails?.sending) || 0) + (Number(s.emails?.retrying) || 0)) > 0;
 }
 
 /** One row of the compact order panel: an item, or a run of identical machine-likely opens / clicks. */

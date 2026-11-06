@@ -13,12 +13,55 @@ import { EmailTrackingService, PREMIUM_FEATURES, effectiveTier, recentStatLines 
 import { EmailLinkService } from './email-link.service';
 import { EmailTrackingPlugin } from './plugin';
 import { getOptions, getLicenceStatus, hasPremiumAccess, getEvalState, getEvalInstanceId, configuredSigningSecret } from './options';
-import { dateParam, getLimiter, intParam, realIp, requireAdmin, scopedChannel } from './http-helpers';
+import { dateParam, deliveryEventsUnavailable, getLimiter, intParam, realIp, requireAdmin, scopedChannel } from './http-helpers';
 import { verifyClickSignature } from './click-signature';
 import { csvCell, CSV_BOM } from './csv';
 import { redactSensitiveUrl } from './link-meta';
+import {
+    ATTEMPT_COLUMNS, ATTEMPT_STATES, AttemptInfo, attemptInfosFor, AttemptState, mayHaveRetry, SendClock, sendClock, SENDING_SQL, sendingSince,
+    sqlTime, stateFields, STORED_STATES, TimelineStart, UNKNOWN_SQL, unknownParams, UNSETTLED_SQL, unsettledSince,
+} from './send-attempts';
 
 const loggerCtx = 'EmailTrackingController';
+
+const DAY_MS = 86_400_000;
+
+/** Rows a `state` filter reads that needs each email's other attempts (failed, retrying, retried, deferred, unknown), newest first. */
+const STATE_CANDIDATES = 5000;
+const EXPORT_ROWS = 50_000;
+
+/** The Email Log list's columns (`updatedAt`: when a refused attempt's failure was recorded). */
+const LIST_COLUMNS = `id, \`createdAt\`, \`updatedAt\`, type, recipient, subject, status,
+                    \`customerId\`, \`orderId\`, \`orderCode\`, \`invoiceId\`, \`applicationId\`,
+                    \`channelId\`, \`openCount\`, \`firstOpenedAt\`, \`lastOpenedAt\`,
+                    \`clickCount\`, \`firstClickedAt\`, \`smtpResponse\`, \`errorMessage\``;
+
+/** The CSV export's columns, plus what reading the attempt needs. */
+const EXPORT_COLUMNS = `id, \`createdAt\`, \`updatedAt\`, type, recipient, subject, status,
+                    \`openCount\`, \`clickCount\`, \`customerId\`, \`orderId\`, \`orderCode\`, \`invoiceId\`, \`channelId\`,
+                    \`smtpMessageId\`, \`smtpResponse\`, \`errorMessage\``;
+
+/** A validated Email Log filter: WHERE parts and their parameters, the period, and the `state` filter. */
+interface LogFilter {
+    where: string[];
+    params: any[];
+    /** Days back (null: no limit). */
+    fromDays: number | null;
+    /** `state=`: how the send went (send-attempts.ts). */
+    states: AttemptState[] | null;
+    /** A state needs each email's other attempts, so the rows are read and picked here (not in SQL). */
+    classified: boolean;
+    /** The database's "now" and the timeline start the filter was built for: the SQL bounds and the rows' states use the same. */
+    clock: SendClock;
+}
+
+/** SQL and parameter of a `state` that the row alone decides (STORED_STATES). */
+function storedStateSql(state: AttemptState, clock: SendClock, dbType: string | undefined): { sql: string; params: any[] } {
+    if (state === 'sending') return { sql: SENDING_SQL, params: [sendingSince(clock.now, dbType)] };
+    // Neither in flight nor without any reply recorded (`unknown`).
+    if (state === 'sent') return { sql: `(status = 'sent' AND NOT ${UNSETTLED_SQL})`, params: [unsettledSince(clock.now, clock.timelineFrom, dbType)] };
+    return { sql: 'status = ?', params: [state] };
+}
 
 /** Hosts a legacy (unsigned) click token may redirect to: the shop itself plus any tracked hosts. */
 function ownHosts(): string[] {
@@ -501,14 +544,25 @@ export class EmailTrackingController {
     /**
      * Admin: list email events, with filtering for the "Email Log" page
      * and the per-customer Emails tab. Filterable by customerId, orderId,
-     * orderCode, status, type, recipient, and a date range.
+     * orderCode, status (as stored), state (how the send went), type,
+     * recipient, a date range and a period in days.
      *
-     * GET /email-track/log?customerId=&orderId=&status=&take=
+     * GET /email-track/log?customerId=&orderId=&status=&state=&fromDays=&take=
      */
-    /** Validated WHERE for the log list and export (400 on a bad value); non-default channels only see their own rows. */
-    private buildLogFilter(ctx: RequestContext, q: any): { where: string[]; params: any[] } | { error: string } {
+    /**
+     * Validated WHERE for the log list, its summary and the export (400 on a
+     * bad value); non-default channels only see their own rows. `fromDays`:
+     * the last n days (`all` or 0: no limit). `state`: comma-separated
+     * states (send-attempts.ts) — those the row alone decides become SQL,
+     * the others (failed, retrying, retried, deferred, unknown) are picked
+     * after reading each email's attempts (`selectLog`). `clock`: the
+     * database's "now" (`sendClock`), which the period counts back from.
+     */
+    private buildLogFilter(ctx: RequestContext, q: any, clock: SendClock): LogFilter | { error: string } {
+        const now = clock.now;
         const where: string[] = [];
         const params: any[] = [];
+        const dbType = this.dbType();
         const int = (name: string, col: string) => {
             if (q[name] === undefined || q[name] === '') return true;
             const n = intParam(q[name], 1, 2147483647);
@@ -528,9 +582,90 @@ export class EmailTrackingController {
         if (q.recipient) { where.push('recipient LIKE ?'); params.push(`%${String(q.recipient).slice(0, 190).replace(/[\\%_]/g, m => '\\' + m)}%`); }
         if (q.from) { const d = dateParam(q.from); if (!d) return { error: 'from is not a date' }; where.push('\`createdAt\` >= ?'); params.push(d); }
         if (q.to) { const d = dateParam(q.to); if (!d) return { error: 'to is not a date' }; where.push('\`createdAt\` <= ?'); params.push(d); }
+        let fromDays: number | null = null;
+        if (q.fromDays !== undefined && q.fromDays !== '' && q.fromDays !== 'all' && String(q.fromDays) !== '0') {
+            fromDays = intParam(q.fromDays, 1, 3650);
+            if (fromDays === null) return { error: 'fromDays must be a number of days (1 to 3650) or all' };
+            where.push('\`createdAt\` >= ?'); params.push(sqlTime(new Date(now - fromDays * DAY_MS), dbType));
+        }
+        let states: AttemptState[] | null = null;
+        let classified = false;
+        if (q.state) {
+            const list = Array.from(new Set(String(q.state).split(',').map(x => x.trim()).filter(Boolean))) as AttemptState[];
+            if (!list.length || list.some(x => !ATTEMPT_STATES.includes(x))) return { error: `state must be one or more of ${ATTEMPT_STATES.join(', ')}` };
+            states = list;
+            classified = list.some(x => !STORED_STATES.includes(x));
+            if (!classified) {
+                const parts = list.map(x => storedStateSql(x, clock, dbType));
+                where.push(`(${parts.map(x => x.sql).join(' OR ')})`);
+                for (const x of parts) params.push(...x.params);
+            }
+        }
         const scope = scopedChannel(ctx);
         if (scope) { where.push('\`channelId\` = ?'); params.push(scope); }
-        return { where, params };
+        return { where, params, fromDays, states, classified, clock };
+    }
+
+    /** The TypeORM driver type (`mysql`, `postgres`, `sqljs` …). */
+    private dbType(): string {
+        return String((this.connection.rawConnection.options as any)?.type || '');
+    }
+
+    private readonly timeline = new TimelineStart();
+
+    /** What the send states are read against: the database's "now" and when the event timeline began. */
+    private clock(): Promise<SendClock> {
+        const db = adapterFor(this.connection.rawConnection);
+        return sendClock((sql, params) => db.query(sql, params), this.dbType(), this.timeline);
+    }
+
+    /**
+     * The filtered log, newest first: one page of rows, the total, and how
+     * each row's send went (send-attempts.ts). A `state` filter the row alone
+     * cannot decide reads the refused attempts and those without any reply
+     * recorded (and the rows of any other state asked for, at most `cap`) and
+     * keeps the matching ones. `relatedFor`: `all` reads the attempts around
+     * every row (the list shows each row's retry links), `refused` only
+     * around those whose state a later attempt can change (enough for their
+     * state; the export).
+     */
+    private async selectLog(f: LogFilter, columns: string, take: number, skip: number, cap: number, relatedFor: 'all' | 'refused'):
+        Promise<{ rows: any[]; total: number; infos: Map<number, AttemptInfo> }> {
+        const db = adapterFor(this.connection.rawConnection);
+        const query = (sql: string, params?: any[]) => db.query(sql, params);
+        const dbType = this.dbType();
+        const seedsOf = (rows: any[]) => (relatedFor === 'all' ? rows : rows.filter(mayHaveRetry));
+        const readAt = { now: f.clock.now, timelineFrom: f.clock.timelineFrom, dbType };
+        if (!f.classified) {
+            const whereClause = f.where.length ? ` WHERE ${f.where.join(' AND ')}` : '';
+            // Backticks: email_log is a TypeORM entity table, so its camelCase columns are quoted on Postgres.
+            const rows: any[] = await db.query(
+                `SELECT ${columns}
+                 FROM email_log${whereClause}
+                 ORDER BY id DESC
+                 LIMIT ? OFFSET ?`,
+                [...f.params, take, skip],
+            );
+            const counted = await db.query(`SELECT COUNT(*) AS total FROM email_log${whereClause}`, f.params);
+            const infos = await attemptInfosFor(query, rows || [], { ...readAt, seeds: seedsOf(rows || []) });
+            return { rows: rows || [], total: Number(counted?.[0]?.total) || 0, infos };
+        }
+        const either = ["status IN ('failed', 'deferred')", UNKNOWN_SQL];
+        const eitherParams: any[] = [...unknownParams(f.clock.now, f.clock.timelineFrom, dbType)];
+        for (const s of f.states || []) {
+            if (!STORED_STATES.includes(s)) continue;
+            const x = storedStateSql(s, f.clock, dbType);
+            either.push(x.sql);
+            eitherParams.push(...x.params);
+        }
+        const candidateClause = ` WHERE ${[...f.where, `(${either.join(' OR ')})`].join(' AND ')}`;
+        const candidates: any[] = (await db.query(
+            `SELECT ${columns} FROM email_log${candidateClause} ORDER BY id DESC LIMIT ?`,
+            [...f.params, ...eitherParams, cap],
+        )) || [];
+        const infos = await attemptInfosFor(query, candidates, { ...readAt, seeds: seedsOf(candidates) });
+        const picked = candidates.filter(r => (f.states || []).includes(infos.get(Number(r.id))?.state as AttemptState));
+        return { rows: picked.slice(skip, skip + take), total: picked.length, infos };
     }
 
     @Get('log')
@@ -539,50 +674,86 @@ export class EmailTrackingController {
         const q = req.query as any;
         const take = intParam(q.take, 1, 500) ?? 100;
         const skip = intParam(q.skip, 0, 10_000_000) ?? 0;
-        const built = this.buildLogFilter(ctx, q);
+        const built = this.buildLogFilter(ctx, q, await this.clock());
         if ('error' in built) return res.status(400).json({ error: built.error });
-        const { where, params } = built;
-
-        const whereClause = where.length ? ` WHERE ${where.join(' AND ')}` : '';
-        // Backticks: email_log is a TypeORM entity table, so its camelCase columns are quoted on Postgres.
-        const rows = await adapterFor(this.connection.rawConnection).query(
-            `SELECT id, \`createdAt\`, type, recipient, subject, status,
-                    \`customerId\`, \`orderId\`, \`orderCode\`, \`invoiceId\`, \`applicationId\`,
-                    \`channelId\`, \`openCount\`, \`firstOpenedAt\`, \`lastOpenedAt\`,
-                    \`clickCount\`, \`firstClickedAt\`, \`smtpResponse\`, \`errorMessage\`
-             FROM email_log
-             ${whereClause}
-             ORDER BY id DESC
-             LIMIT ? OFFSET ?`,
-            [...params, take, skip],
-        );
-        const [{ total }] = await adapterFor(this.connection.rawConnection).query(
-            `SELECT COUNT(*) AS total FROM email_log${whereClause}`, params,
-        );
-        return res.json({ items: rows, total: Number(total) || 0, take, skip });
+        const { rows, total, infos } = await this.selectLog(built, LIST_COLUMNS, take, skip, STATE_CANDIDATES, 'all');
+        // Each row with how its send went: `state`, and the attempt it retried or that retried it.
+        const items = rows.map(r => ({ ...r, ...stateFields(infos.get(Number(r.id))) }));
+        return res.json({ items, total, take, skip, fromDays: built.fromDays });
     }
 
-    /** Admin: aggregate counts by status for a quick dashboard tile. */
+    /**
+     * Admin: the Email Log cards — counts per state over the same filters
+     * and period as the list (default the last 30 days; `fromDays=all`: every
+     * email), so a card and the list it opens agree. `total` is every row;
+     * `sent` leaves out sends still in flight (`sending`) and those that never
+     * recorded a reply (`unknown`); a refused attempt is `failed` only when no
+     * retry is due and none was made (`retrying`, `retried` otherwise);
+     * `deferred` keeps deferrals that were not retried. `deliveryEvents`:
+     * deliveries can be reported (`deliveryEventsReason` says why not).
+     */
     @Get('log/summary')
     async logSummary(@Ctx() ctx: RequestContext, @Req() req: Request, @Res() res: Response) {
         if (!requireAdmin(ctx, res, false)) return;
-        const fromDays = intParam((req.query as any).fromDays, 1, 365) ?? 30;
-        const scope = scopedChannel(ctx);
-        const rows = await adapterFor(this.connection.rawConnection).query(
+        const q: any = { ...(req.query as any) };
+        if (q.fromDays === undefined || q.fromDays === '') q.fromDays = 30;
+        delete q.status;
+        delete q.state;
+        const built = this.buildLogFilter(ctx, q, await this.clock());
+        if ('error' in built) return res.status(400).json({ error: built.error });
+        const db = adapterFor(this.connection.rawConnection);
+        const dbType = this.dbType();
+        const { now, timelineFrom } = built.clock;
+        const whereClause = built.where.length ? ` WHERE ${built.where.join(' AND ')}` : '';
+        const rows = await db.query(
             `SELECT status, COUNT(*) AS n, SUM(\`openCount\`) AS opens, SUM(\`clickCount\`) AS clicks
-             FROM email_log
-             WHERE \`createdAt\` >= DATE_SUB(NOW(), INTERVAL ? DAY)${scope ? ' AND \`channelId\` = ?' : ''}
+             FROM email_log${whereClause}
              GROUP BY status`,
-            scope ? [fromDays, scope] : [fromDays],
+            built.params,
         );
         // Every status, `total` over all of them (delivered and suppressed included).
-        const summary: any = { total: 0, sent: 0, delivered: 0, failed: 0, deferred: 0, bounced: 0, complained: 0, suppressed: 0, opens: 0, clicks: 0, fromDays };
-        for (const r of rows) {
+        const deliveryOff = deliveryEventsUnavailable();
+        const summary: any = {
+            total: 0, sent: 0, delivered: 0, failed: 0, deferred: 0, bounced: 0, complained: 0, suppressed: 0,
+            sending: 0, retrying: 0, retried: 0, unknown: 0, opens: 0, clicks: 0, fromDays: built.fromDays,
+            deliveryEvents: deliveryOff === null, deliveryEventsReason: deliveryOff,
+        };
+        for (const r of rows || []) {
             summary[r.status] = Number(r.n);
             summary.total += Number(r.n) || 0;
             summary.opens += Number(r.opens) || 0;
             summary.clicks += Number(r.clicks) || 0;
         }
+        // Stored as sent but not sent: still in flight, or no reply ever recorded (only rows since the event timeline began can be).
+        const unsettledClause = ` WHERE ${[...built.where, UNSETTLED_SQL].join(' AND ')}`;
+        const unsettled = await db.query(
+            `SELECT SUM(CASE WHEN ${SENDING_SQL} THEN 1 ELSE 0 END) AS sending, SUM(CASE WHEN ${UNKNOWN_SQL} THEN 1 ELSE 0 END) AS \`noReply\`
+             FROM email_log${unsettledClause}`,
+            [sendingSince(now, dbType), ...unknownParams(now, timelineFrom, dbType), ...built.params, unsettledSince(now, timelineFrom, dbType)],
+        );
+        const noReply = Number(unsettled?.[0]?.noReply) || 0;
+        summary.sending = Number(unsettled?.[0]?.sending) || 0;
+        summary.sent = Math.max(0, summary.sent - summary.sending - noReply);
+        // Refused attempts and those without a reply: failed for good, retrying, unknown or retried — read with each email's other attempts.
+        const candidateClause = ` WHERE ${[...built.where, `(status IN ('failed', 'deferred') OR ${UNKNOWN_SQL})`].join(' AND ')}`;
+        const candidates: any[] = (await db.query(
+            `SELECT ${ATTEMPT_COLUMNS} FROM email_log${candidateClause} ORDER BY id DESC LIMIT ?`,
+            [...built.params, ...unknownParams(now, timelineFrom, dbType), STATE_CANDIDATES],
+        )) || [];
+        const infos = await attemptInfosFor((sql, params) => db.query(sql, params), candidates, { now, timelineFrom, dbType });
+        const read = { failed: 0, deferred: 0, sent: 0 };
+        const states = { failed: 0, deferred: 0, retrying: 0, retried: 0, unknown: 0 };
+        for (const r of candidates) {
+            if (r.status === 'failed' || r.status === 'deferred' || r.status === 'sent') read[r.status as 'failed' | 'deferred' | 'sent']++;
+            const state = infos.get(Number(r.id))?.state;
+            if (state === 'failed' || state === 'deferred' || state === 'retrying' || state === 'retried' || state === 'unknown') states[state]++;
+        }
+        // Beyond the rows read (the newest STATE_CANDIDATES), the stored status stands, and a row without a reply stays unknown.
+        summary.failed = states.failed + Math.max(0, summary.failed - read.failed);
+        summary.deferred = states.deferred + Math.max(0, summary.deferred - read.deferred);
+        summary.unknown = states.unknown + Math.max(0, noReply - read.sent);
+        summary.retrying = states.retrying;
+        summary.retried = states.retried;
         return res.json(summary);
     }
 
@@ -595,29 +766,8 @@ export class EmailTrackingController {
             return res.status(402).json(premiumFeatureError('vendure-plugin-email-tracking'));
         }
         const days = intParam((req.query as any).fromDays, 1, 365) ?? 30;
-        const scope = scopedChannel(ctx);
-        const rows = await adapterFor(this.connection.rawConnection).query(
-            `SELECT type,
-                    COUNT(*)                                                                AS sent,
-                    SUM(CASE WHEN \`openCount\` > 0 THEN 1 ELSE 0 END)                       AS opened,
-                    SUM(CASE WHEN \`clickCount\` > 0 THEN 1 ELSE 0 END)                      AS clicked,
-                    SUM(CASE WHEN status='bounced' OR status='complained' THEN 1 ELSE 0 END) AS bounced,
-                    SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END)                        AS failed,
-                    SUM(CASE WHEN status='suppressed' THEN 1 ELSE 0 END)                    AS suppressed,
-                    SUM(\`openCount\`)                                                       AS totalOpens,
-                    SUM(\`clickCount\`)                                                      AS totalClicks
-             FROM email_log
-             WHERE \`createdAt\` >= DATE_SUB(NOW(), INTERVAL ? DAY)${scope ? ' AND \`channelId\` = ?' : ''}
-             GROUP BY type
-             ORDER BY sent DESC`,
-            scope ? [days, scope] : [days],
-        );
-        return res.json({ days, types: rows.map((r: any) => ({
-            ...r,
-            openRate: r.sent > 0 ? (r.opened / r.sent) : 0,
-            clickRate: r.sent > 0 ? (r.clicked / r.sent) : 0,
-            ctor: r.opened > 0 ? (r.clicked / r.opened) : 0, // click-to-open
-        })) });
+        // `sent`: accepted by the mail server (never a refused attempt); `failed`: failed for good, as the Failed card.
+        return res.json({ days, types: await this.tracking.statsByTemplate(days, scopedChannel(ctx)) });
     }
 
     /** Admin: CSV export of the log with the same filters as the list view. */
@@ -628,24 +778,16 @@ export class EmailTrackingController {
             return res.status(402).json(premiumFeatureError('vendure-plugin-email-tracking'));
         }
         const q = req.query as any;
-        const built = this.buildLogFilter(ctx, q);
+        const built = this.buildLogFilter(ctx, q, await this.clock());
         if ('error' in built) return res.status(400).json({ error: built.error });
-        const { where, params } = built;
-        const whereClause = where.length ? ` WHERE ${where.join(' AND ')}` : '';
-        const rows = await adapterFor(this.connection.rawConnection).query(
-            `SELECT \`createdAt\`, type, recipient, subject, status,
-                    \`openCount\`, \`clickCount\`, \`customerId\`, \`orderCode\`, \`invoiceId\`,
-                    \`smtpMessageId\`, \`errorMessage\`
-             FROM email_log ${whereClause}
-             ORDER BY id DESC LIMIT 50000`,
-            params,
-        );
+        // The list's rows (same filters, `state` included), with each one's state as the last column.
+        const { rows, infos } = await this.selectLog(built, EXPORT_COLUMNS, EXPORT_ROWS, 0, EXPORT_ROWS, 'refused');
         // Cache-Control: private, no-store (requireAdmin): a CDN that caches .csv must never keep an export.
         res.setHeader('Content-Type', 'text/csv; charset=utf-8');
         res.setHeader('Content-Disposition', `attachment; filename="email-log-${new Date().toISOString().slice(0, 10)}.csv"`);
         // Formula-injection guard + quoting (csv.ts, shared with the order activity export).
         const esc = csvCell;
-        const header = 'createdAt,type,recipient,subject,status,openCount,clickCount,customerId,orderCode,invoiceId,smtpMessageId,errorMessage\n';
+        const header = 'createdAt,type,recipient,subject,status,openCount,clickCount,customerId,orderCode,invoiceId,smtpMessageId,errorMessage,state\n';
         res.write(CSV_BOM + header);
         for (const r of rows) {
             res.write([
@@ -654,6 +796,7 @@ export class EmailTrackingController {
                 esc(r.openCount), esc(r.clickCount), esc(r.customerId),
                 esc(r.orderCode), esc(r.invoiceId),
                 esc(r.smtpMessageId), esc(r.errorMessage),
+                esc(infos.get(Number(r.id))?.state ?? r.status),
             ].join(',') + '\n');
         }
         return res.end();

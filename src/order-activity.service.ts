@@ -4,9 +4,11 @@ import { adapterFor } from '@huloglobal/vendure-licence-sdk';
 import { Brackets } from 'typeorm';
 import { EmailEvent } from './email-event.entity';
 import { EmailLog } from './email-log.entity';
+import { deliveryEventsConfigured } from './http-helpers';
+import { AttemptInfo, attemptStates, sendClock, TimelineStart, timeOf } from './send-attempts';
 import {
     decodeCursor, eventIdOfKey, eventItem, eventTypesForFilter, formatMoney, historyItem, legacyItems, LogEventStats,
-    matchesFilter, pageOf, PaymentInfo, SortKey, sortKeyOf, compareKeys, compareItems, TimelineFilter, TimelineItem, toIso,
+    matchesFilter, pageOf, PaymentInfo, SortKey, sortKeyOf, compareKeys, compareItems, TimelineFilter, TimelineItem, toIso, withAttempt,
 } from './timeline';
 
 const loggerCtx = 'OrderActivityService';
@@ -38,7 +40,18 @@ export interface ActivitySummary {
         total: number; currencyCode: string; totalFormatted: string;
         paymentState: string; customerEmail: string | null; customerName: string | null;
     };
-    emails: { total: number; sent: number; delivered: number; opened: number; firstOpenAt: string | null; clicked: number; bounced: number };
+    /**
+     * Counted per email: a retried email counts once, by its latest attempt (send-attempts.ts). `attempts`: every
+     * email_log row. `sent`: accepted by the mail server. `delivered`: reported by a provider webhook — never known
+     * without one (`deliveryEvents`). `sending`: no reply from the mail server yet. `retrying`: refused for the time
+     * being, the retry is due. `deferred`: put off by the mail server (a 4xx reply) or, after accepting it, by the
+     * receiving server. `unknown`: no reply was ever recorded (the send was cut off). `failed`: refused for good, or
+     * every retry failed. `suppressed`: not sent, the recipient is on the suppression list.
+     */
+    emails: {
+        total: number; attempts: number; sent: number; delivered: number; sending: number; retrying: number; deferred: number; unknown: number;
+        failed: number; suppressed: number; opened: number; firstOpenAt: string | null; clicked: number; bounced: number;
+    };
     /** `recorded` is the email_log counter (hits through bare ids never move it while a signing
      *  secret exists); the classified figures count events, and `unverified` events — through a
      *  link without a signature — are counted only in `unsigned`. */
@@ -46,6 +59,8 @@ export interface ActivitySummary {
     clicks: { recorded: number; human: number; machine: number; unknown: number; unsigned: number };
     /** Vendure's order history could not be read (the timeline then has email rows only). */
     historyUnavailable: boolean;
+    /** Deliveries can be reported: a provider webhook is configured and its delivery events are recorded (not the free tier). */
+    deliveryEvents: boolean;
 }
 
 interface ActivityContext {
@@ -58,14 +73,19 @@ interface ActivityContext {
     logs: EmailLog[];
     stats: Map<number, LogEventStats & { delivered: number }>;
     emailInfo: Map<number, { id: number; type: string | null; subject: string | null }>;
+    /** How each email_log row's send went, read with the order's other attempts. */
+    attempts: Map<number, AttemptInfo>;
 }
 
 /**
  * Builds an order's activity timeline by merging three sources:
- * `email_event` rows for the order, legacy items synthesised from its
- * `email_log` rows (emails sent before 0.16.0), and Vendure's own order
- * history (state, payment, fulfilment, refund, cancellation, modification,
- * coupon and note entries — private notes included, for admins).
+ * `email_event` rows for the order, items read from its `email_log` rows
+ * (emails sent before 0.16.0, marked legacy, and sends still in flight or
+ * cut off) and Vendure's own order history (state, payment, fulfilment,
+ * refund, cancellation, modification, coupon and note entries — private
+ * notes included, for admins). Send items are told with how their attempt
+ * ended (send-attempts.ts): "Sending…", "Deferred, retrying", "Sent after 1
+ * retry", "No reply recorded".
  */
 @Injectable()
 export class OrderActivityService {
@@ -124,6 +144,14 @@ export class OrderActivityService {
         return { rows: out, failed: false };
     }
 
+    /**
+     * When the event timeline began on this install (null: no send event yet,
+     * or no `email_event` table). Emails created before it are the legacy
+     * ones; a later email without a send event is still in flight, was cut
+     * off, or its event could not be written — never "sent before 0.16.0".
+     */
+    private readonly timeline = new TimelineStart();
+
     private async loadLogStats(orderId: number): Promise<Map<number, LogEventStats & { delivered: number }>> {
         const map = new Map<number, LogEventStats & { delivered: number }>();
         try {
@@ -153,20 +181,32 @@ export class OrderActivityService {
 
     private async loadContext(ctx: RequestContext, order: Order, full: boolean): Promise<ActivityContext> {
         const orderId = Number(order.id);
-        const [historyResult, logs, stats] = await Promise.all([
+        const db = adapterFor(this.connection.rawConnection);
+        const dbType = String((this.connection.rawConnection.options as any)?.type || '');
+        const [historyResult, logs, stats, clock] = await Promise.all([
             this.loadHistory(ctx, orderId),
             this.connection.rawConnection.getRepository(EmailLog).find({ where: { orderId }, order: { id: 'ASC' } as any, take: 1000 }),
             this.loadLogStats(orderId),
+            // The database's "now": it wrote createdAt / updatedAt.
+            sendClock((sql, params) => db.query(sql, params), dbType, this.timeline),
         ]);
+        const { timelineFrom } = clock;
         const payments: PaymentInfo[] = (order.payments || []).map((p: any) => ({
             id: String(p.id), amount: Number(p.amount) || 0, method: String(p.method || ''), state: String(p.state || ''),
             refunds: (p.refunds || []).map((r: any) => ({ id: String(r.id), total: Number(r.total) || 0, reason: r.reason ?? null })),
         }));
         const precision = this.moneyPrecision();
         const history = historyResult.rows.map(h => historyItem(h, payments, order.currencyCode, full, precision));
-        const legacy = logs.flatMap(l => legacyItems(l, stats.get(Number(l.id)), full));
+        // An order's emails are all its attempts: retries are linked among them. A send event settles a missing reply.
+        const attempts = attemptStates(logs, clock.now, { recorded: id => !!stats.get(id)?.hasSend, timelineFrom });
+        const legacy = logs.flatMap(l => {
+            const attempt = attempts.get(Number(l.id));
+            // Legacy only when the row predates the event timeline; a send in flight never is.
+            const old = attempt?.state !== 'sending' && (timelineFrom === null || (timeOf(l.createdAt) ?? 0) < timelineFrom);
+            return legacyItems(l, stats.get(Number(l.id)), full, { legacy: old, attempt });
+        });
         const emailInfo = new Map(logs.map(l => [Number(l.id), { id: Number(l.id), type: l.type ?? null, subject: l.subject ?? null }]));
-        return { order, payments, history, historyUnavailable: historyResult.failed, legacy, logs, stats, emailInfo };
+        return { order, payments, history, historyUnavailable: historyResult.failed, legacy, logs, stats, emailInfo, attempts };
     }
 
     /** `email_event` rows for the order past the cursor (keyset), at most `limit`. */
@@ -218,7 +258,7 @@ export class OrderActivityService {
         const types = eventTypesForFilter(opts.filter);
         const orderId = Number(order.id);
         const rows = await this.eventRows(orderId, types, cursor, opts.take + 1, opts.order);
-        const events = rows.map(r => eventItem(r, c.emailInfo.get(Number(r.emailLogId)), full));
+        const events = rows.map(r => withAttempt(eventItem(r, c.emailInfo.get(Number(r.emailLogId)), full), c.attempts.get(Number(r.emailLogId))));
         const others = [...c.history, ...c.legacy].filter(i => matchesFilter(i, opts.filter));
         const result = pageOf([...events, ...others], cursor, opts.take, opts.order);
         const total = others.length + await this.eventCount(orderId, types);
@@ -230,7 +270,7 @@ export class OrderActivityService {
         Promise<{ items: TimelineItem[]; truncated: boolean; context: ActivityContext }> {
         const c = await this.loadContext(ctx, order, full);
         const rows = await this.eventRows(Number(order.id), eventTypesForFilter(filter), null, EXPORT_MAX_ITEMS + 1, 'asc');
-        const events = rows.map(r => eventItem(r, c.emailInfo.get(Number(r.emailLogId)), full));
+        const events = rows.map(r => withAttempt(eventItem(r, c.emailInfo.get(Number(r.emailLogId)), full), c.attempts.get(Number(r.emailLogId))));
         const truncated = rows.length > EXPORT_MAX_ITEMS;
         const all = [...events.slice(0, EXPORT_MAX_ITEMS), ...c.history, ...c.legacy].filter(i => matchesFilter(i, filter));
         all.sort(compareItems);
@@ -244,11 +284,14 @@ export class OrderActivityService {
 
     /**
      * Header figures: the order, its emails, and human / machine opens and
-     * clicks. The opened / first open / clicked / recorded figures come from
-     * the `email_log` counters, which hits through bare (unsigned) ids never
-     * move while a signing secret exists (the evidence report needs one);
-     * those hits are counted only in `unsigned`. Cap marker rows are not
-     * opens or clicks and are not counted.
+     * clicks. Emails are counted once each, by their latest attempt (a
+     * retried email is one email): accepted by the mail server, sending,
+     * retrying, deferred, no reply recorded, failed, suppressed; delivered as
+     * a provider webhook reported it. The opened / first open / clicked /
+     * recorded figures come from the `email_log` counters, which hits through
+     * bare (unsigned) ids never move while a signing secret exists (the
+     * evidence report needs one); those hits are counted only in `unsigned`.
+     * Cap marker rows are not opens or clicks and are not counted.
      */
     async summary(order: Order, c: ActivityContext): Promise<ActivitySummary> {
         const logs = c.logs;
@@ -280,6 +323,10 @@ export class OrderActivityService {
             ? payments.map(p => `${p.state} (${formatMoney(p.amount, order.currencyCode, precision)} via ${p.method})`).join('; ')
             : 'No payment';
         const customer: any = order.customer;
+        const info = (l: EmailLog) => c.attempts.get(Number(l.id));
+        // One row per email: its latest attempt (a retried attempt has its retry after it).
+        const latest = logs.filter(l => (info(l)?.retriedBy ?? null) === null);
+        const emails = (pick: (i: AttemptInfo) => boolean) => latest.filter(l => { const i = info(l); return !!i && pick(i); }).length;
         return {
             order: {
                 id: Number(order.id), code: order.code, state: order.state,
@@ -289,9 +336,16 @@ export class OrderActivityService {
                 customerName: customer ? [customer.firstName, customer.lastName].filter(Boolean).join(' ') || null : null,
             },
             emails: {
-                total: logs.length,
-                sent: logs.filter(l => l.status !== 'suppressed' && l.status !== 'failed').length,
+                total: latest.length,
+                attempts: logs.length,
+                sent: emails(i => i.accepted),
                 delivered: logs.filter(l => l.status === 'delivered' || (c.stats.get(Number(l.id))?.delivered ?? 0) > 0).length,
+                sending: emails(i => i.state === 'sending'),
+                retrying: emails(i => i.state === 'retrying'),
+                deferred: emails(i => i.state === 'deferred'),
+                unknown: emails(i => i.state === 'unknown'),
+                failed: emails(i => i.state === 'failed'),
+                suppressed: emails(i => i.state === 'suppressed'),
                 opened: logs.filter(l => Number(l.openCount) > 0).length,
                 firstOpenAt: firstOpen,
                 clicked: logs.filter(l => Number(l.clickCount) > 0).length,
@@ -300,6 +354,7 @@ export class OrderActivityService {
             opens: { recorded: logs.reduce((n, l) => n + (Number(l.openCount) || 0), 0), ...classes.open },
             clicks: { recorded: logs.reduce((n, l) => n + (Number(l.clickCount) || 0), 0), ...classes.click },
             historyUnavailable: c.historyUnavailable,
+            deliveryEvents: deliveryEventsConfigured(),
         };
     }
 }

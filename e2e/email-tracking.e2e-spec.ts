@@ -503,13 +503,15 @@ describe('@huloglobal/vendure-plugin-email-tracking', () => {
     });
 
     it('order activity JSON: email events, legacy rows and Vendure history merged chronologically, with filters and cursor pages', async () => {
-        // An email sent "before 0.16.0": a log row with JSON history and no event rows.
+        // An email sent "before 0.16.0": a log row with JSON history and no event rows, created before the event timeline began
+        // (since 0.16.3 only such rows are legacy; a later row without a send event is still being sent).
         const repo = conn().rawConnection.getRepository(EmailLog);
-        await repo.save(repo.create({
+        const shipped = await repo.save(repo.create({
             type: 'shipping-update', recipient: 'buyer@example.com', subject: 'Your order shipped', fromAddress: 'shop@example.com', status: 'sent', tracked: true,
             channelId: 1, orderId: order.id, orderCode: order.code, customerId: order.customerId, openCount: 1, clickCount: 0,
             opensJson: JSON.stringify([{ ts: new Date(Date.now() - 1000).toISOString(), ip: 'abc', ua: 'Mozilla/5.0 (iPhone) AppleWebKit Mobile', client: 'Apple Mail', platform: 'iOS', isBot: false }]),
         } as Partial<EmailLog>));
+        await repo.update(shipped.id, { createdAt: new Date(Date.now() - 2 * 86_400_000) } as any);
         await adminClient.asSuperAdmin();
         const res = await adminClient.fetch(`${BASE}/email-track/orders/${order.id}/activity?take=100`);
         expect(res.status).toBe(200);
@@ -681,13 +683,16 @@ describe('@huloglobal/vendure-plugin-email-tracking', () => {
         expect(list.total).toBe(await logs.count({ where: [{ status: 'sent' }, { status: 'delivered' }] as any }));
         expect(new Set(list.items.map((r: any) => r.status))).toEqual(new Set(['sent', 'delivered']));
         expect((await adminClient.fetch(`${BASE}/email-track/log?status=${'x'.repeat(40)}`)).status).toBe(400);
-        // log/summary uses MySQL / Postgres date arithmetic (DATE_SUB), which sql.js has never run.
-        if (/sql\.?js|sqlite/.test(String((conn().rawConnection.options as any).type))) return;
+        // log/summary binds its period as a date (no DATE_SUB since 0.16.3), so it runs on sql.js too.
         const s = await (await adminClient.fetch(`${BASE}/email-track/log/summary?fromDays=30`)).json();
         expect(s.delivered).toBeGreaterThanOrEqual(1);
-        const statuses = ['sent', 'delivered', 'failed', 'deferred', 'bounced', 'complained', 'suppressed'];
-        expect(s.total).toBe(statuses.reduce((n, k) => n + (s[k] || 0), 0));
-        expect(list.total).toBe(s.sent + s.delivered);
+        const states = ['sent', 'sending', 'delivered', 'failed', 'retrying', 'retried', 'deferred', 'bounced', 'complained', 'suppressed', 'unknown'];
+        expect(s.total).toBe(states.reduce((n, k) => n + (s[k] || 0), 0));
+        // The Sent card opens the list by state, over the card's own period: the same emails.
+        const card = await (await adminClient.fetch(`${BASE}/email-track/log?state=sent,delivered&fromDays=30&take=500`)).json();
+        expect(card.total).toBe(s.sent + s.delivered);
+        const failed = await (await adminClient.fetch(`${BASE}/email-track/log?state=failed&fromDays=30&take=500`)).json();
+        expect(failed.total).toBe(s.failed);
     });
 
     it('the Email Log CSV export answers (log/:id no longer takes it): BOM, quoted cells, a status list, never cached; only digits name an email', async () => {
@@ -721,7 +726,7 @@ describe('@huloglobal/vendure-plugin-email-tracking', () => {
         const bytes = Buffer.from(await res.arrayBuffer());
         expect([...bytes.subarray(0, 3)]).toEqual([0xef, 0xbb, 0xbf]);
         const rows = parseCsv(bytes.toString('utf8').replace(/^\uFEFF/, ''));
-        expect(rows[0].join(',')).toBe('createdAt,type,recipient,subject,status,openCount,clickCount,customerId,orderCode,invoiceId,smtpMessageId,errorMessage');
+        expect(rows[0].join(',')).toBe('createdAt,type,recipient,subject,status,openCount,clickCount,customerId,orderCode,invoiceId,smtpMessageId,errorMessage,state');
         expect(rows.length - 1).toBe(await logs.count({ where: [{ status: 'sent' }, { status: 'delivered' }] as any }));
         expect(new Set(rows.slice(1).map(r => r[4]))).toEqual(new Set(['sent', 'delivered']));
         expect(rows.slice(1).some(r => r[2] === 'buyer@example.com')).toBe(true);

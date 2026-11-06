@@ -76,7 +76,22 @@ import {
                     <div class="et-card"><div class="et-k">Customer</div><div class="et-v">{{ s.order.customerName || '—' }}</div><div class="et-sub">{{ s.order.customerEmail }}</div></div>
                     <div class="et-card"><div class="et-k">Placed</div><div class="et-v">{{ s.order.placedAt ? (s.order.placedAt | localeDate:'medium') : '—' }}</div><div class="et-sub">{{ s.order.state }}</div></div>
                     <div class="et-card"><div class="et-k">Total</div><div class="et-v">{{ s.order.totalFormatted }}</div><div class="et-sub">{{ s.order.paymentState }}</div></div>
-                    <div class="et-card"><div class="et-k">Emails</div><div class="et-v">{{ s.emails.total }}</div><div class="et-sub">{{ s.emails.sent }} sent · {{ s.emails.delivered }} delivered · {{ s.emails.bounced }} bounced / complained</div></div>
+                    <div class="et-card">
+                        <div class="et-k">Emails</div>
+                        <div class="et-v">{{ s.emails.total }}</div>
+                        <div class="et-sub">
+                            <ng-container *ngIf="s.emails.attempts > s.emails.total">{{ s.emails.attempts }} attempts · </ng-container>
+                            <span [title]="s.deliveryEvents ? 'The mail server took the email (SMTP 250)' : 'The mail server took the email (SMTP 250). Delivery to the inbox is not reported: no provider webhook is configured.'">{{ s.emails.sent }} accepted by the mail server</span>
+                            <ng-container *ngIf="s.deliveryEvents"> · {{ s.emails.delivered }} delivered</ng-container>
+                            <ng-container *ngIf="s.emails.sending"> · <span class="et-tone-warn">{{ s.emails.sending }} sending</span></ng-container>
+                            <ng-container *ngIf="s.emails.retrying"> · <span class="et-tone-warn">{{ s.emails.retrying }} retrying</span></ng-container>
+                            <ng-container *ngIf="s.emails.deferred"> · <span class="et-tone-warn">{{ s.emails.deferred }} deferred</span></ng-container>
+                            <ng-container *ngIf="s.emails.unknown"> · <span class="et-tone-warn" title="No reply from the mail server was ever recorded: the send was cut off, for example by a restart">{{ s.emails.unknown }} no reply recorded</span></ng-container>
+                            <ng-container *ngIf="s.emails.failed"> · <span class="et-tone-bad">{{ s.emails.failed }} failed</span></ng-container>
+                            <ng-container *ngIf="s.emails.suppressed"> · {{ s.emails.suppressed }} suppressed</ng-container>
+                            · {{ s.emails.bounced }} bounced / complained
+                        </div>
+                    </div>
                     <div class="et-card"><div class="et-k">Opened</div><div class="et-v">{{ s.emails.opened }}</div><div class="et-sub">{{ s.emails.firstOpenAt ? 'first ' + (s.emails.firstOpenAt | localeDate:'short') : 'not yet' }}</div></div>
                     <div class="et-card"><div class="et-k">Opens: human / machine</div><div class="et-v">{{ s.opens.human }} / {{ s.opens.machine }}</div><div class="et-sub">{{ s.opens.recorded }} recorded · {{ s.opens.unknown }} unknown<ng-container *ngIf="s.opens.unsigned"> · {{ s.opens.unsigned }} unverified (not counted)</ng-container></div></div>
                     <div class="et-card"><div class="et-k">Clicked</div><div class="et-v">{{ s.emails.clicked }}</div><div class="et-sub">{{ s.clicks.recorded }} clicks · {{ s.clicks.human }} human-likely<ng-container *ngIf="s.clicks.unsigned"> · {{ s.clicks.unsigned }} unverified (not counted)</ng-container></div></div>
@@ -111,7 +126,7 @@ import {
                                     <div class="et-event"><clr-icon [attr.shape]="icon(i)" size="14" aria-hidden="true"></clr-icon> <span [ngClass]="tone(i)">{{ i.label }}</span></div>
                                     <div class="et-muted et-small" *ngIf="i.emailType">{{ i.emailType }}<ng-container *ngIf="i.emailLogId"> #{{ i.emailLogId }}</ng-container></div>
                                     <div class="et-muted et-small" *ngIf="i.kind === 'event'">via {{ i.source }}</div>
-                                    <span class="et-legacy" *ngIf="i.legacy" title="Reconstructed from the email log (sent before 0.16.0)">legacy</span>
+                                    <span class="et-legacy" *ngIf="i.legacy" title="Read from the email log: sent before the event timeline began (0.16.0)">legacy</span>
                                 </td>
                                 <td class="et-detail">
                                     <div class="et-text" *ngIf="i.detail">{{ i.detail }}</div>

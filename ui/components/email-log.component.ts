@@ -1,7 +1,7 @@
 import { Component, OnDestroy, OnInit, ChangeDetectorRef } from '@angular/core';
 import { ActivatedRoute } from '@angular/router';
 import { NotificationService } from '@vendure/admin-ui/core';
-import { EmailTrackingHttp, EmailTrackingTier } from './activity-shared';
+import { EmailTrackingHttp, EmailTrackingTier, stateLabel } from './activity-shared';
 
 interface EmailRow {
     id: number;
@@ -23,6 +23,12 @@ interface EmailRow {
     firstClickedAt: string | null;
     smtpResponse: string | null;
     errorMessage: string | null;
+    /** How the send went (the server reads each email's attempts): sending, retrying, retried, failed, unknown (no reply recorded), or the status. */
+    state?: string | null;
+    attempt?: number;
+    /** The attempt this row retried, and the later attempt that retried it. */
+    retryOf?: number | null;
+    retriedBy?: number | null;
 }
 
 interface EmailDetail extends EmailRow {
@@ -144,7 +150,7 @@ interface EmailDetail extends EmailRow {
                     <div class="hulo-help-card">
                         <div class="hulo-help-num">2</div>
                         <h4>Click a status card to filter</h4>
-                        <p>Sent, Failed, Pending — the counters above are clickable and filter the table below.</p>
+                        <p>Sent, In progress, Failed — the counters above are clickable and filter the table below. Both cover the period you pick.</p>
                     </div>
                     <div class="hulo-help-card">
                         <div class="hulo-help-num">3</div>
@@ -198,35 +204,52 @@ interface EmailDetail extends EmailRow {
 
         <vdr-page-block>
             <div class="summary-row">
-                <div class="summary-card" [class.active]="filterStatus===''" (click)="setStatus('')">
+                <div class="summary-card" [class.active]="filterState===''" (click)="setState('')">
                     <div class="num" style="color:#1d4ed8">{{ totalAll() }}</div>
-                    <div class="lbl">Last {{ summary.fromDays }} days</div>
+                    <div class="lbl">{{ summary.fromDays ? 'Last ' + summary.fromDays + ' days' : 'All time' }}</div>
                 </div>
-                <div class="summary-card" [class.active]="filterStatus==='sent,delivered'" (click)="setStatus('sent,delivered')" title="Accepted for delivery: sent, and delivered as reported by a provider webhook">
+                <div class="summary-card" [class.active]="filterState==='sent,delivered'" (click)="setState('sent,delivered')" title="Accepted by the mail server, with no bounce, deferral or complaint since (delivered included)">
                     <div class="num" style="color:#047857">{{ (summary.sent || 0) + (summary.delivered || 0) }}</div>
                     <div class="lbl">Sent</div>
                 </div>
-                <div class="summary-card" [class.active]="filterStatus==='delivered'" (click)="setStatus('delivered')" title="Delivery confirmed by a provider webhook">
+                <div class="summary-card" [class.active]="filterState==='delivered'" (click)="setState('delivered')"
+                    [title]="summary.deliveryEvents !== false ? 'Delivery confirmed by a provider webhook'
+                        : summary.deliveryEventsReason === 'free-tier' ? 'A provider webhook reports deliveries, but the free tier does not record them'
+                        : 'Delivery is reported by a provider webhook, and none is configured'">
                     <div class="num" style="color:#15803d">{{ summary.delivered || 0 }}</div>
                     <div class="lbl">Delivered</div>
+                    <div class="sub" *ngIf="summary.deliveryEvents === false">{{ summary.deliveryEventsReason === 'free-tier' ? 'not recorded on the free tier' : 'not reported: no provider webhook' }}</div>
                 </div>
-                <div class="summary-card" [class.active]="filterStatus==='failed'" (click)="setStatus('failed')">
+                <div class="summary-card" [class.active]="filterState==='sending,retrying'" (click)="setState('sending,retrying')" title="No reply from the mail server yet, or refused for the time being and waiting for its retry">
+                    <div class="num" style="color:#b45309">{{ (summary.sending || 0) + (summary.retrying || 0) }}</div>
+                    <div class="lbl">In progress</div>
+                </div>
+                <div class="summary-card" [class.active]="filterState==='failed'" (click)="setState('failed')" title="Not sent: refused for good, or every retry failed">
                     <div class="num" style="color:#b91c1c">{{ summary.failed || 0 }}</div>
                     <div class="lbl">Failed</div>
                 </div>
-                <div class="summary-card" [class.active]="filterStatus==='deferred'" (click)="setStatus('deferred')">
+                <div class="summary-card" *ngIf="summary.unknown" [class.active]="filterState==='unknown'" (click)="setState('unknown')"
+                    title="No reply from the mail server was ever recorded: the send was cut off, for example by a restart. Not counted as sent.">
+                    <div class="num" style="color:#a16207">{{ summary.unknown }}</div>
+                    <div class="lbl">No reply</div>
+                </div>
+                <div class="summary-card" [class.active]="filterState==='retried'" (click)="setState('retried')" title="Attempts the mail server refused that were sent again: the later attempt has its own row">
+                    <div class="num" style="color:#a16207">{{ summary.retried || 0 }}</div>
+                    <div class="lbl">Retried</div>
+                </div>
+                <div class="summary-card" [class.active]="filterState==='deferred'" (click)="setState('deferred')" title="Delivery deferred by the receiving server or the provider">
                     <div class="num" style="color:#b45309">{{ summary.deferred || 0 }}</div>
                     <div class="lbl">Deferred</div>
                 </div>
-                <div class="summary-card" [class.active]="filterStatus==='bounced'" (click)="setStatus('bounced')">
+                <div class="summary-card" [class.active]="filterState==='bounced'" (click)="setState('bounced')">
                     <div class="num" style="color:#7e22ce">{{ summary.bounced || 0 }}</div>
                     <div class="lbl">Bounced</div>
                 </div>
-                <div class="summary-card" [class.active]="filterStatus==='complained'" (click)="setStatus('complained')">
+                <div class="summary-card" [class.active]="filterState==='complained'" (click)="setState('complained')">
                     <div class="num" style="color:#be185d">{{ summary.complained || 0 }}</div>
                     <div class="lbl">Complained</div>
                 </div>
-                <div class="summary-card" [class.active]="filterStatus==='suppressed'" (click)="setStatus('suppressed')" title="Not sent: the recipient is on the suppression list">
+                <div class="summary-card" [class.active]="filterState==='suppressed'" (click)="setState('suppressed')" title="Not sent: the recipient is on the suppression list">
                     <div class="num" style="color:#475569">{{ summary.suppressed || 0 }}</div>
                     <div class="lbl">Suppressed</div>
                 </div>
@@ -249,7 +272,7 @@ interface EmailDetail extends EmailRow {
                 <div *ngIf="!byTemplateLocked && !byTemplateLoading && byTemplate.length === 0" class="setup-hint">No emails in the last 30 days.</div>
                 <div class="scroll-x" *ngIf="!byTemplateLocked && byTemplate.length > 0">
                 <table class="table table-compact" style="margin-top:0">
-                    <thead><tr><th>Template</th><th>Sent</th><th>Opened</th><th>Open rate</th><th>Clicked</th><th>Click rate</th><th>Bounced</th><th>Failed</th></tr></thead>
+                    <thead><tr><th>Template</th><th title="Accepted by the mail server, including emails that later bounced, were deferred or were marked as spam. The rates are over these.">Sent</th><th>Opened</th><th>Open rate</th><th>Clicked</th><th>Click rate</th><th>Bounced</th><th title="Refused for good, or every retry failed">Failed</th></tr></thead>
                     <tbody>
                         <tr *ngFor="let t of byTemplate">
                             <td><span class="pill type-pill">{{ t.type }}</span></td>
@@ -271,6 +294,13 @@ interface EmailDetail extends EmailRow {
             <div class="card">
                 <div class="card-block">
                     <div class="filters">
+                        <select class="form-input" [ngModel]="filterDays" (ngModelChange)="setPeriod($event)" aria-label="Period" title="The period of the list and the cards above">
+                            <option [ngValue]="7">Last 7 days</option>
+                            <option [ngValue]="30">Last 30 days</option>
+                            <option [ngValue]="90">Last 90 days</option>
+                            <option [ngValue]="365">Last 365 days</option>
+                            <option [ngValue]="null">All time</option>
+                        </select>
                         <input class="form-input" placeholder="Filter recipient…" [(ngModel)]="filterRecipient" (keyup.enter)="load()">
                         <input class="form-input" placeholder="Filter type…" [(ngModel)]="filterType" (keyup.enter)="load()">
                         <input class="form-input" placeholder="Customer ID" [(ngModel)]="filterCustomerId" (keyup.enter)="load()">
@@ -278,6 +308,10 @@ interface EmailDetail extends EmailRow {
                         <button class="btn btn-secondary" (click)="load()">Apply</button>
                         <button class="btn btn-link" (click)="clearFilters()">Clear</button>
                     </div>
+                    <p class="help-text period-hint" *ngIf="filterDays && searching()">
+                        Searching the last {{ filterDays }} days.
+                        <button type="button" class="btn btn-sm btn-link" (click)="setPeriod(null)">Search all time</button>
+                    </p>
 
                     <div *ngIf="loading" style="padding:30px;text-align:center;color:var(--color-component-color-300)">Loading…</div>
                     <div *ngIf="!loading && rows.length === 0" style="padding:30px;text-align:center;color:var(--color-component-color-300)">
@@ -311,7 +345,9 @@ interface EmailDetail extends EmailRow {
                                     </td>
                                     <td style="max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" [title]="r.subject">{{ r.subject }}</td>
                                     <td>
-                                        <span class="pill" [ngClass]="'status-' + r.status">{{ r.status }}</span>
+                                        <span class="pill" [ngClass]="'status-' + (r.state || r.status)" [title]="r.state && r.state !== r.status ? 'Stored status: ' + r.status : ''">{{ stateText(r.state || r.status) }}</span>
+                                        <div class="help-text" *ngIf="r.retryOf">retry of #{{ r.retryOf }}</div>
+                                        <div class="help-text" *ngIf="r.retriedBy">retried as #{{ r.retriedBy }}</div>
                                     </td>
                                     <td>
                                         <span [class.muted]="r.openCount === 0" [style.color]="r.openCount > 0 ? '#10b981' : null">{{ r.openCount }}</span>
@@ -507,6 +543,8 @@ interface EmailDetail extends EmailRow {
         .summary-card .sub { font-size: 10px; color: var(--color-component-color-300); margin-top: 2px; }
 
         .filters { display: flex; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; }
+        .period-hint { margin: -6px 0 10px; }
+        .period-hint .btn { margin: 0; padding: 0 4px; min-height: 0; height: auto; line-height: inherit; vertical-align: baseline; }
         .filters .form-input {
             padding: 4px 8px; height: 32px;
             border: 1px solid var(--color-component-border-200);
@@ -533,6 +571,10 @@ interface EmailDetail extends EmailRow {
         .status-bounced { background: #7e22ce; }
         .status-complained { background: #be185d; }
         .status-suppressed { background: #475569; }
+        .status-sending { background: #475569; }
+        .status-retrying { background: #b45309; }
+        .status-retried { background: #92400e; }
+        .status-unknown { background: #a16207; }
         .linked-cell { white-space: normal; }
         .activity-link { display: block; }
         /* Wide tables scroll inside their own box; the page never grows wider than the screen. */
@@ -591,7 +633,11 @@ export class EmailLogComponent implements OnInit, OnDestroy {
     skip = 0;
     loading = false;
 
-    filterStatus = '';
+    /** The cards' filter: how the send went (`state=`), one or several comma-separated. */
+    filterState = '';
+    /** The period of the list and the cards (null: all time). Opened for a customer or an order: all time. */
+    filterDays: number | null = 30;
+    private initialDays: number | null = 30;
     filterRecipient = '';
     filterType = '';
     filterCustomerId = '';
@@ -600,7 +646,10 @@ export class EmailLogComponent implements OnInit, OnDestroy {
      *  customer (used by the per-customer Emails tab). */
     lockedCustomerId: string | null = null;
 
-    summary: any = { total: 0, sent: 0, delivered: 0, failed: 0, deferred: 0, bounced: 0, complained: 0, suppressed: 0, opens: 0, clicks: 0, fromDays: 30 };
+    summary: any = {
+        total: 0, sent: 0, delivered: 0, failed: 0, deferred: 0, bounced: 0, complained: 0, suppressed: 0, sending: 0, retrying: 0, retried: 0,
+        unknown: 0, opens: 0, clicks: 0, fromDays: 30, deliveryEvents: null, deliveryEventsReason: null,
+    };
 
     expandedId: number | null = null;
     detail: EmailDetail | null = null;
@@ -948,6 +997,8 @@ export class EmailLogComponent implements OnInit, OnDestroy {
         }
         const oCode = this.route.snapshot.queryParamMap.get('orderCode');
         if (oCode) this.filterOrderCode = oCode;
+        // Opened for one customer or order: every email of theirs, whenever it was sent.
+        if (cId || oCode) this.filterDays = this.initialDays = null;
         this.loadSetup();
         this.loadDigest();
         this.load();
@@ -959,21 +1010,36 @@ export class EmailLogComponent implements OnInit, OnDestroy {
         this.updateDismissed = true;
     }
 
-    /** Every email of the period, whatever its status (the server's `total`; summed here for an older server). */
+    /** Every email of the period, whatever its state (the server's `total`; summed here for an older server). */
     totalAll(): number {
         if (typeof this.summary?.total === 'number') return this.summary.total;
-        return ['sent', 'delivered', 'failed', 'deferred', 'bounced', 'complained', 'suppressed']
+        return ['sent', 'sending', 'delivered', 'failed', 'retrying', 'retried', 'deferred', 'bounced', 'complained', 'suppressed', 'unknown']
             .reduce((n, k) => n + (Number(this.summary?.[k]) || 0), 0);
     }
 
-    setStatus(s: string) {
-        this.filterStatus = s;
+    readonly stateText = stateLabel;
+
+    /** A recipient, type, customer or order is being looked for (the list keeps its period: the hint offers all time). */
+    searching(): boolean {
+        return !!(this.filterRecipient || this.filterType || this.filterCustomerId || this.filterOrderCode);
+    }
+
+    /** A card: the list shows the emails it counts (same period and filters). */
+    setState(s: string) {
+        this.filterState = s;
+        this.skip = 0;
+        this.load();
+    }
+
+    setPeriod(days: number | null) {
+        this.filterDays = days;
         this.skip = 0;
         this.load();
     }
 
     clearFilters() {
-        this.filterStatus = '';
+        this.filterState = '';
+        this.filterDays = this.initialDays;
         this.filterRecipient = '';
         this.filterType = '';
         this.filterCustomerId = this.lockedCustomerId || '';
@@ -982,13 +1048,19 @@ export class EmailLogComponent implements OnInit, OnDestroy {
         this.load();
     }
 
-    private buildParams(): string {
-        const p: string[] = [`take=${this.take}`, `skip=${this.skip}`];
-        if (this.filterStatus) p.push(`status=${encodeURIComponent(this.filterStatus)}`);
+    /** The filters the cards and the list share: the period, recipient, type, customer and order. */
+    private filterParams(): string[] {
+        const p: string[] = [`fromDays=${this.filterDays || 'all'}`];
         if (this.filterRecipient) p.push(`recipient=${encodeURIComponent(this.filterRecipient)}`);
         if (this.filterType) p.push(`type=${encodeURIComponent(this.filterType)}`);
         if (this.filterCustomerId) p.push(`customerId=${encodeURIComponent(this.filterCustomerId)}`);
         if (this.filterOrderCode) p.push(`orderCode=${encodeURIComponent(this.filterOrderCode)}`);
+        return p;
+    }
+
+    private buildParams(): string {
+        const p: string[] = [`take=${this.take}`, `skip=${this.skip}`, ...this.filterParams()];
+        if (this.filterState) p.push(`state=${encodeURIComponent(this.filterState)}`);
         return p.join('&');
     }
 
@@ -996,7 +1068,8 @@ export class EmailLogComponent implements OnInit, OnDestroy {
         this.loading = true;
         Promise.all([
             this.http.get<any>(`/email-track/log?${this.buildParams()}`).toPromise(),
-            this.http.get<any>('/email-track/log/summary?fromDays=30').toPromise(),
+            // The cards count what the list shows: same period and filters, every state.
+            this.http.get<any>(`/email-track/log/summary?${this.filterParams().join('&')}`).toPromise(),
         ]).then(([list, summary]) => {
             this.rows = list?.items || [];
             this.total = list?.total || 0;

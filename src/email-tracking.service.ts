@@ -15,6 +15,7 @@ import { EmailEventService } from './email-event.service';
 import { correlationHeaders, mergeHeaders, providerMessageIdFromSmtpReply, sendPayload, wrapTrackedHtml } from './outgoing-mail';
 import { findLink, LinkMeta, redactSensitiveUrl } from './link-meta';
 import { dedupeKeyFor } from './webhook-mappers';
+import { ACCEPTED_SQL, ATTEMPT_COLUMNS, attemptInfosFor, replyCode, SendClock, sendClock, TimelineStart, unsettledSince } from './send-attempts';
 
 const loggerCtx = 'EmailTrackingService';
 
@@ -40,6 +41,7 @@ const DAY_MS = 86_400_000;
 
 /** One aggregate row over `email_log` for a time window. */
 export interface LogAggregate {
+    /** Emails the mail server accepted (send-attempts.ts): refused, suppressed and in-flight attempts are not counted. */
     tracked: number;
     opens: number;
     clicks: number;
@@ -70,6 +72,27 @@ export const STAT_LABELS: Array<{ key: string; label: string; format: DigestStat
     { key: 'emailsBounced', label: 'bounces and complaints caught', format: 'count' },
     { key: 'openRatePct', label: 'open rate', format: 'percent' },
 ];
+
+/** One row of the By template table (`GET /email-track/log/stats/by-template`, `huloEmailStatsByTemplate`). */
+export interface TemplateStats {
+    type: string | null;
+    /** Accepted by the mail server: the open and click rates are over these. */
+    sent: number;
+    opened: number;
+    clicked: number;
+    bounced: number;
+    /** Failed for good, as the Email Log's Failed card counts them. */
+    failed: number;
+    suppressed: number;
+    totalOpens: number;
+    totalClicks: number;
+    openRate: number;
+    clickRate: number;
+    ctor: number;
+}
+
+/** Refused attempts read per By template table (newest first); older ones are left out of `failed`. */
+const TEMPLATE_REFUSED_CAP = 5000;
 
 export function digestStats(current: Record<string, number>, previous?: Record<string, number> | null): DigestStat[] {
     return STAT_LABELS.map(l => ({
@@ -291,18 +314,22 @@ export class EmailTrackingService implements OnApplicationBootstrap, OnModuleDes
 
     /** One aggregate over `email_log` for `[from, to)`. Install-wide (every
      *  channel): these are the numbers the licence server and the weekly
-     *  report use. Fails soft to zeros. */
+     *  report use. `tracked` counts the emails the mail server accepted (a
+     *  refused attempt, a suppressed one, a send still in flight or one that
+     *  never recorded a reply is not an email tracked), so the open rate is
+     *  over emails that went out. Fails soft to zeros. */
     async aggregate(from: Date, to: Date): Promise<LogAggregate> {
         try {
+            const { now, timelineFrom } = await this.clock();
             const rows = await adapterFor(this.connection.rawConnection).query(
-                `SELECT COUNT(*)                                                                AS tracked,
+                `SELECT SUM(CASE WHEN ${ACCEPTED_SQL} THEN 1 ELSE 0 END)                      AS tracked,
                         SUM(\`openCount\`)                                                       AS opens,
                         SUM(\`clickCount\`)                                                      AS clicks,
                         SUM(CASE WHEN status='bounced' OR status='complained' THEN 1 ELSE 0 END) AS bounced,
                         SUM(CASE WHEN \`openCount\` > 0 THEN 1 ELSE 0 END)                       AS opened
                  FROM email_log
                  WHERE \`createdAt\` >= ? AND \`createdAt\` < ?`,
-                [from, to],
+                [unsettledSince(now, timelineFrom, this.dbType()), from, to],
             );
             const r = rows?.[0] || {};
             return { tracked: Number(r.tracked) || 0, opens: Number(r.opens) || 0, clicks: Number(r.clicks) || 0, bounced: Number(r.bounced) || 0, opened: Number(r.opened) || 0 };
@@ -321,6 +348,63 @@ export class EmailTrackingService implements OnApplicationBootstrap, OnModuleDes
     /** Last 30 days — the evaluation + heartbeat stats provider. */
     evalStats(): Promise<Record<string, number>> {
         return this.statsForDays(30);
+    }
+
+    /**
+     * Per-template figures for the last `days` days, optionally one channel's.
+     * `sent` counts the emails the mail server accepted — never a refused
+     * attempt (a failed try that was retried included), a send still in
+     * flight or one that never recorded a reply — and the open and click
+     * rates are over them. `failed` counts the emails that failed for good,
+     * exactly as the Email Log's Failed card: a refused attempt that was
+     * retried, or whose retry is due, is not one.
+     */
+    async statsByTemplate(days: number, scope: number | null): Promise<TemplateStats[]> {
+        const db = adapterFor(this.connection.rawConnection);
+        const { now, timelineFrom } = await this.clock();
+        const since = this.sqlDate(new Date(now - days * DAY_MS));
+        const rows: any[] = await db.query(
+            `SELECT type,
+                    SUM(CASE WHEN ${ACCEPTED_SQL} THEN 1 ELSE 0 END)                         AS sent,
+                    SUM(CASE WHEN \`openCount\` > 0 THEN 1 ELSE 0 END)                       AS opened,
+                    SUM(CASE WHEN \`clickCount\` > 0 THEN 1 ELSE 0 END)                      AS clicked,
+                    SUM(CASE WHEN status='bounced' OR status='complained' THEN 1 ELSE 0 END) AS bounced,
+                    SUM(CASE WHEN status='suppressed' THEN 1 ELSE 0 END)                    AS suppressed,
+                    SUM(\`openCount\`)                                                       AS totalOpens,
+                    SUM(\`clickCount\`)                                                      AS totalClicks
+             FROM email_log
+             WHERE \`createdAt\` >= ?${scope ? ' AND \`channelId\` = ?' : ''}
+             GROUP BY type
+             ORDER BY sent DESC`,
+            [unsettledSince(now, timelineFrom, this.dbType()), since, ...(scope ? [scope] : [])],
+        );
+        const refused: any[] = await db.query(
+            `SELECT ${ATTEMPT_COLUMNS} FROM email_log
+             WHERE status IN ('failed', 'deferred') AND \`createdAt\` >= ?${scope ? ' AND \`channelId\` = ?' : ''}
+             ORDER BY id DESC LIMIT ?`,
+            [since, ...(scope ? [scope] : []), TEMPLATE_REFUSED_CAP],
+        );
+        const infos = await attemptInfosFor((sql, params) => db.query(sql, params), refused || [], { now, timelineFrom, dbType: this.dbType() });
+        const failed = new Map<string, number>();
+        for (const r of refused || []) {
+            if (infos.get(Number(r.id))?.state === 'failed') failed.set(String(r.type), (failed.get(String(r.type)) || 0) + 1);
+        }
+        return (rows || []).map(r => {
+            const sent = Number(r.sent) || 0;
+            const opened = Number(r.opened) || 0;
+            const clicked = Number(r.clicked) || 0;
+            return {
+                type: r.type ?? null, sent, opened, clicked,
+                bounced: Number(r.bounced) || 0,
+                failed: failed.get(String(r.type)) || 0,
+                suppressed: Number(r.suppressed) || 0,
+                totalOpens: Number(r.totalOpens) || 0,
+                totalClicks: Number(r.totalClicks) || 0,
+                openRate: sent > 0 ? opened / sent : 0,
+                clickRate: sent > 0 ? clicked / sent : 0,
+                ctor: opened > 0 ? clicked / opened : 0, // click-to-open
+            };
+        });
     }
 
     /** Real checks behind the set-up checklist card and the digest tips. */
@@ -567,8 +651,8 @@ export class EmailTrackingService implements OnApplicationBootstrap, OnModuleDes
         saved.smtpResponse = String(info?.response || '').slice(0, 500);
         // Stored without angle brackets; the bounce matcher accepts both forms.
         saved.smtpMessageId = String(info?.messageId || '').replace(/^<|>$/g, '').slice(0, 500);
-        // Gmail's "250 2.0.0 OK" → sent. 4xx → deferred. 5xx → failed.
-        const code = parseInt((info?.response || '').split(' ')[0], 10);
+        // Gmail's "250 2.0.0 OK" → sent. 4xx → deferred. 5xx → failed. A reply without a code (SES: the message id) → sent.
+        const code = replyCode(info?.response) ?? 0;
         const outcome: EmailLogStatus = code >= 500 ? 'failed' : code >= 400 ? 'deferred' : 'sent';
         await repo.update(saved.id, { smtpResponse: saved.smtpResponse, smtpMessageId: saved.smtpMessageId });
         saved.status = await this.settleSendStatus(Number(saved.id), outcome);
@@ -628,6 +712,19 @@ export class EmailTrackingService implements OnApplicationBootstrap, OnModuleDes
         return SQLITE_TYPES.has(String((this.connection.rawConnection.options as any)?.type || ''))
             ? d.toISOString().replace('T', ' ').replace('Z', '')
             : d;
+    }
+
+    /** The TypeORM driver type (`mysql`, `postgres`, `sqljs` …). */
+    private dbType(): string {
+        return String((this.connection.rawConnection.options as any)?.type || '');
+    }
+
+    private readonly timeline = new TimelineStart();
+
+    /** What the send states are read against: the database's "now" (it writes `createdAt`) and when the event timeline began. */
+    private clock(): Promise<SendClock> {
+        const db = adapterFor(this.connection.rawConnection);
+        return sendClock((sql, params) => db.query(sql, params), this.dbType(), this.timeline);
     }
 
     /** Record a pixel-hit open. Idempotent re-counting; firstOpenedAt only

@@ -1,8 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import {
     canonicalJson, compareItems, decodeCursor, encodeCursor, eventIdOfKey, eventItem, evidenceItems, formatMoney, historyItem, isUnsignedItem,
-    legacyItems, linkLabel, matchesFilter, pageOf, parseFilter, redacted, sortKeyOf, timelineSha256, TimelineItem, toIso,
+    legacyItems, linkLabel, matchesFilter, pageOf, parseFilter, redacted, sendLabel, sortKeyOf, timelineSha256, TimelineItem, toIso, withAttempt,
 } from './timeline';
+import type { AttemptInfo } from './send-attempts';
 
 const T = (s: number) => new Date(Date.UTC(2026, 10, 4, 10, 0, s));
 
@@ -203,5 +204,71 @@ describe('0.16.0 review: labels, legacy status time, evidence selection, money p
         const payments = [{ id: '4', amount: 12500, method: 'card', state: 'Settled', refunds: [] }];
         expect(historyItem(hist(5, 0, 'ORDER_PAYMENT_TRANSITION', { paymentId: 4, from: 'Created', to: 'Settled' }), payments, 'KWD', false, 3).detail)
             .toBe('Created → Settled — KWD 12.500 via card');
+    });
+});
+
+describe('0.16.3: send attempts on the timeline', () => {
+    const info = (over: Partial<AttemptInfo>): AttemptInfo => ({
+        state: 'sent', outcome: 'accepted', accepted: true, temporary: false, attempt: 1, retryOf: null, retriedBy: null, ...over,
+    });
+    const inFlight = { id: 9001, createdAt: T(0), updatedAt: T(0), type: 'order-confirmation', subject: 'Order confirmation for #ZQ898ZQ3J55JGZ4Z', status: 'sent', smtpResponse: null };
+
+    it('a row still being sent reads "Sending…": kind log, never legacy, never "Email sent"', () => {
+        const [item] = legacyItems(inFlight, undefined, false, { legacy: false, attempt: info({ state: 'sending', outcome: 'pending', accepted: false }) });
+        expect(item).toMatchObject({ id: 'l9001-s', kind: 'log', legacy: false, type: 'sending', label: 'Sending…', sendState: 'sending', source: 'email_log' });
+        expect(item.detail).toBe('“Order confirmation for #ZQ898ZQ3J55JGZ4Z” — no reply from the mail server yet');
+        expect(matchesFilter(item, 'emails')).toBe(true);
+        expect(matchesFilter(item, 'delivery')).toBe(false);
+    });
+
+    it('a row that never recorded a reply reads "No reply recorded" ("…, retried" once the job ran it again), never "Email sent"', () => {
+        const [item] = legacyItems(inFlight, undefined, false, { legacy: false, attempt: info({ state: 'unknown', outcome: 'unknown', accepted: false }) });
+        expect(item).toMatchObject({ kind: 'log', legacy: false, type: 'unknown', label: 'No reply recorded', sendState: 'unknown' });
+        expect(item.detail).toBe('“Order confirmation for #ZQ898ZQ3J55JGZ4Z” — no reply from the mail server was recorded');
+        expect(matchesFilter(item, 'emails')).toBe(true);
+        const [again] = legacyItems(inFlight, undefined, false, { legacy: false, attempt: info({ state: 'retried', outcome: 'unknown', accepted: false, retriedBy: 9002 }) });
+        expect(again).toMatchObject({ type: 'unknown', label: 'No reply recorded, retried', sendState: 'retried', retriedBy: 9002 });
+        expect(again.detail).toBe('“Order confirmation for #ZQ898ZQ3J55JGZ4Z” — no reply from the mail server was recorded — retried as email #9002');
+    });
+
+    it('legacy only when asked (the row predates the event timeline); a later row without a send event is kind log', () => {
+        const sent = { ...inFlight, smtpResponse: '250 2.0.0 OK' };
+        expect(legacyItems(sent, undefined, false)[0]).toMatchObject({ kind: 'legacy', legacy: true, type: 'sent', label: 'Email sent' });
+        const later = legacyItems({ ...sent, status: 'delivered', opensJson: JSON.stringify([{ ts: T(5).toISOString(), ua: 'x' }]) }, undefined, false, { legacy: false, attempt: info({ state: 'delivered' }) });
+        expect(later.map(i => [i.id, i.kind, i.legacy])).toEqual([['l9001-s', 'log', false], ['l9001-st', 'log', false], ['l9001-o0', 'log', false]]);
+        expect(later[1].detail).toContain('status from the email log');
+        expect(later[1].detail).not.toContain('0.16.0');
+    });
+
+    it('smtp send events are told with how their attempt ended, linked to the other attempt; other events are untouched', () => {
+        const failed = eventItem(ev(20, 1, 'failed', { emailLogId: 9001, detail: '421 4.3.0 Temporary System Problem' }), undefined, false);
+        const retried = withAttempt(failed, info({ state: 'retried', outcome: 'temporary', temporary: true, accepted: false, retriedBy: 9002 }));
+        expect(retried).toMatchObject({ label: 'Deferred, retried', sendState: 'retried', retryOf: null, retriedBy: 9002, type: 'failed' });
+        expect(retried.detail).toBe('421 4.3.0 Temporary System Problem — retried as email #9002');
+        expect(withAttempt(failed, info({ state: 'retrying', outcome: 'temporary', temporary: true, accepted: false }))).toMatchObject({ label: 'Deferred, retrying', sendState: 'retrying' });
+        expect(withAttempt(failed, info({ state: 'failed', outcome: 'permanent', accepted: false, attempt: 6, retryOf: 9005 })).label).toBe('Send failed after 5 retries');
+        expect(withAttempt(failed, info({ state: 'retried', outcome: 'permanent', accepted: false, retriedBy: 9002 })).label).toBe('Send failed, retried');
+        expect(withAttempt(failed, info({ state: 'failed', outcome: 'permanent', accepted: false })).label).toBe('Send failed');
+        const sent = eventItem(ev(21, 28, 'sent', { emailLogId: 9002, detail: '250 2.0.0 OK' }), undefined, false);
+        const after = withAttempt(sent, info({ attempt: 2, retryOf: 9001 }));
+        expect(after).toMatchObject({ label: 'Sent after 1 retry', sendState: 'sent', retryOf: 9001, retriedBy: null });
+        expect(after.detail).toBe('250 2.0.0 OK — retry of email #9001');
+        expect(withAttempt(sent, info({})).label).toBe('Email sent');
+        expect(sendLabel('sent', info({ attempt: 3, retryOf: 2 }))).toBe('Sent after 2 retries');
+        const open = eventItem(ev(22, 30, 'open'), undefined, false);
+        expect(withAttempt(open, info({ state: 'retried' }))).toBe(open);
+        const provider = eventItem(ev(23, 31, 'deferred', { source: 'sendgrid' }), undefined, false);
+        expect(withAttempt(provider, info({ state: 'retried', retriedBy: 9002 }))).toBe(provider);
+        expect(withAttempt(sent, undefined)).toBe(sent);
+    });
+
+    it('a log item sorts with the legacy items at the same instant, and its cursor round-trips', () => {
+        const [item] = legacyItems(inFlight, undefined, false, { legacy: false, attempt: info({ state: 'sending', outcome: 'pending', accepted: false }) });
+        const key = sortKeyOf(item);
+        expect(key.r).toBe(1);
+        expect(decodeCursor(encodeCursor(key))).toEqual(key);
+        const history = historyItem(hist(1, 0, 'ORDER_STATE_TRANSITION', { from: 'A', to: 'B' }), [], 'GBP', false);
+        const event = eventItem(ev(3, 0, 'sent'), undefined, false);
+        expect([event, item, history].sort(compareItems).map(i => i.kind)).toEqual(['history', 'log', 'event']);
     });
 });

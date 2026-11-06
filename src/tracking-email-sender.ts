@@ -7,6 +7,7 @@ import { adapterFor } from '@huloglobal/vendure-licence-sdk';
 import { EmailEventService } from './email-event.service';
 import { correlationHeaders, ExtraHeaderValue, mergeHeaders, providerMessageIdFromSmtpReply, sendPayload, wrapTrackedHtml } from './outgoing-mail';
 import { LinkMeta } from './link-meta';
+import { replyCode } from './send-attempts';
 
 const loggerCtx = 'TrackingEmailSender';
 
@@ -57,9 +58,13 @@ export class CapturingSender extends NodemailerEmailSender {
     }
 }
 
-/** `sent` / `deferred` / `failed` from the SMTP reply code, like `sendTracked`. */
+/**
+ * `sent` / `deferred` / `failed` from the SMTP reply code, like `sendTracked`.
+ * A reply without one is `sent`: the SES transport's reply is the message id
+ * (e.g. "0100018b…"), which read as code 100018, a failure, before 0.16.3.
+ */
 export function statusFromSmtpResponse(response: string | undefined): EmailLogStatus {
-    const code = parseInt(String(response || '').split(' ')[0], 10);
+    const code = replyCode(response) ?? 0;
     if (code >= 500) return 'failed';
     if (code >= 400) return 'deferred';
     return 'sent';
@@ -164,6 +169,9 @@ export class TrackingEmailSender implements EmailSender {
         else if (customerIdByEmail != null) payload.customerId = customerIdByEmail;
         // The log row must never stop the email (OTP, password reset, order
         // confirmation): a DB error here means "send untracked", not "fail".
+        // It is written before SMTP starts, as `sent` with no reply: until the
+        // reply or the error is recorded below, it reads as "Sending…"
+        // (send-attempts.ts), never as sent.
         let saved: EmailLog | null = null;
         try {
             saved = await repo.save(repo.create(payload));
@@ -218,6 +226,12 @@ export class TrackingEmailSender implements EmailSender {
             await this.recordOutcome(saved, status === 'failed' ? 'failed' : status === 'deferred' ? 'deferred' : 'sent', info,
                 info.response ? String(info.response).slice(0, 500) : null, links, signed);
         } else if (saved) {
+            // No reply was captured: an empty one records that the send finished, so the row stops reading as sending.
+            try {
+                await repo.update(saved.id, { smtpResponse: '' } as any);
+            } catch (e: any) {
+                Logger.warn(`smtp result could not be recorded on email #${saved.id}: ${e?.message}`, loggerCtx);
+            }
             await this.recordOutcome(saved, 'sent', null, null, links, signed);
         }
         if (saved) Logger.info(`Tracked plugin-email [${saved.type}] to ${saved.recipient} (id=${saved.id})`, loggerCtx);

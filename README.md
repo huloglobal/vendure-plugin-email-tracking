@@ -120,6 +120,22 @@ EmailTrackingPlugin.uiExtensions
 > `Cache-Control: private, no-store`. The Email Log page counts `delivered`
 > (and `suppressed`) emails in its totals.
 
+> **Since 0.16.3:** no schema change, and stored statuses are not rewritten;
+> they are read the same new way everywhere (see
+> [Send attempts](#send-attempts)). An email still being sent reads
+> "Sending…", never sent, and one cut off before its reply "No reply
+> recorded"; an SMTP 4xx or a connection / timeout error reads "Deferred,
+> retrying" and is linked to the retry ("Sent after 1 retry"); the order
+> card counts emails "accepted by the mail server" and shows "delivered"
+> only when a provider webhook can report it (not on the free tier, which
+> does not record deliveries); only emails from before the event timeline
+> carry the legacy badge. The Email Log's cards and list share one period
+> and filter set, Failed counts emails that failed for good, and By
+> template's Sent counts accepted emails only. The weekly report's "emails
+> tracked" counts accepted emails too, so it reads lower than before for the
+> same emails. SES sends are stored as sent (the SES reply, a message id,
+> was read as a failure code); earlier rows keep their status.
+
 ## Feature tour
 
 ### Universal capture
@@ -176,7 +192,8 @@ per install).
 - **Bounce matching for pipeline mail**: every send through
   `TrackingEmailSender` records nodemailer's Message-ID (without angle
   brackets) and SMTP reply on the row, and sets `sent` / `deferred` /
-  `failed` from the reply code.
+  `failed` from the reply code. The row is written before SMTP starts;
+  until the reply (or the error) is recorded it reads as sending.
 - **Per-row history** of the last 50 opens and clicks. Each entry includes
   timestamp, IP (raw or hashed), parsed email client (Gmail web, Outlook
   desktop, Apple Mail iOS, Thunderbird, …), bot flag for prefetch
@@ -262,7 +279,53 @@ from the send path only. Nothing overwrites `failed` or `suppressed`.
 shows them: a `sent` (or `failed` / `suppressed`) entry from the log row, its
 bounce or delivery status (shown at the send time and saying so: the time
 it was set was never recorded), and the opens and clicks in `opensJson` /
-`clicksJson`, marked `legacy`. No backfill runs.
+`clicksJson`, marked `legacy`. No backfill runs. Since 0.16.3 only emails
+created before the install's first send event are legacy; a later email
+without a send event (still being sent, cut off before its reply, or its
+event could not be written) is read from the log row too, as kind `log`,
+without the badge (the evidence report marks it "from email log").
+
+### Send attempts
+
+Every send writes its `email_log` row before SMTP starts, and Vendure's
+EmailPlugin runs a failed send job again (5 retries), each run with a row
+of its own. Since 0.16.3 every view — the order card and timeline, the
+exports, the evidence report, the Email Log list and cards, By template and
+the weekly figures — reads a row with the other attempts of the same email:
+
+- **Sending**: no reply and no error recorded yet, created in the last 15
+  minutes. It is not counted as sent anywhere.
+- **No reply recorded** (state `unknown`): still no reply or error after
+  that, on an email created after the event timeline began — the send was
+  cut off, for example by a worker restart mid-SMTP. It is not counted as
+  sent. An older email without a reply is from before replies were recorded
+  (0.14.3) and keeps its stored status.
+- **Temporary refusal**: an SMTP 4xx reply, or a connection or timeout
+  error. While the send job can still retry it (within 15 minutes of the
+  failure, fewer than six attempts so far) it reads "Deferred, retrying".
+- **Retry**: the next attempt of the same email — same channel, order, type,
+  recipient and subject — created within 15 minutes of a refused attempt's
+  failure (for an attempt without a reply, within 15 minutes after its
+  sending window). The two are linked (`retryOf` / `retriedBy`): "Deferred, retried" (or
+  "Send failed, retried" after a 5xx, "No reply recorded, retried"), then
+  "Sent after 1 retry".
+- **Failed**: a permanent refusal (SMTP 5xx or any other error) with no
+  later attempt, or a temporary one whose retries are over ("Send failed
+  after 5 retries"). A provider drop after acceptance is failed too.
+- Everything else keeps its stored status (sent, delivered, deferred,
+  bounced, complained, suppressed). A 4xx reply that did not throw stays
+  `deferred`: the job does not run it again.
+
+**Accepted by the mail server** means the SMTP server took the email (sent,
+delivered, bounced, complained, or deferred by the provider afterwards).
+Delivery to the inbox is only known when a provider webhook reports it (and
+the free tier does not record a provider's deliveries); the order summary
+and the Email Log summary say whether deliveries can be reported
+(`deliveryEvents`).
+
+The windows are measured with the database's clock (`createdAt` and
+`updatedAt` are written by the database), so a database session in another
+time zone than the Node process does not shift them.
 
 ### Human / machine classification
 
@@ -288,10 +351,16 @@ failed, suppressed), `order` (order and payment history) and `notes`.
 Cursor pagination, 100 per page by default (`take` up to 500,
 `order=desc` for newest first). The first page carries the summary: order
 code, customer, placed at, total (in the host's `MoneyStrategy` precision),
-payment state, emails sent / delivered / opened (with the first open) /
-clicked / bounced or complained — from the `email_log` counters, which hits
-through bare ids never move — and human vs machine opens and clicks
-(`unverified` events from bare ids are counted apart, as `unsigned`). Every
+payment state, emails (a retried email counts once; `attempts` counts
+rows) accepted by the mail server (`sent`) / delivered as a provider
+webhook reported it / sending / retrying / deferred / without a reply
+(`unknown`) / failed / suppressed / opened (with the first open) / clicked
+/ bounced or complained — the engagement figures from the
+`email_log` counters, which hits through bare ids never move —, whether
+deliveries can be reported at all (`deliveryEvents`: a provider webhook is
+configured, and not the free tier) and human vs machine opens and clicks (`unverified` events from
+bare ids are counted apart, as `unsigned`). Send items carry `sendState`,
+`retryOf` and `retriedBy` (see [Send attempts](#send-attempts)). Every
 response carries a cautionary note: IP-derived location is approximate and
 may show a mail proxy, VPN or scanner. When Vendure's order history cannot
 be read (the server log says why), the response says so
@@ -528,20 +597,35 @@ The free ip-api endpoint logs a warning at boot: it is plain HTTP, limited to
 ### Admin UI
 
 - Global **Email Log** page (Customers → Email Log) with the set-up
-  checklist, weekly-report card, status totals (the period's total over every
-  status; **Sent** = sent + delivered, then Delivered, Failed, Deferred,
-  Bounced, Complained, Suppressed — each card filters the list), a **By template** table
-  (open and click rates per email type, premium), **Export CSV**, filter
-  row, paginated list, and an expand-row detail showing both the open and
-  click history tables with location + device + client per row.
-- **Order detail → Email activity** card: the email summary (emails logged
-  — failed and suppressed ones included —, delivered, opened, clicked,
-  bounced / complained, human vs machine opens),
-  the latest ten rows — consecutive identical machine-likely opens or clicks
+  checklist, weekly-report card, state totals over the period and filters
+  of the list (the period's total over every row; **Sent** = sent +
+  delivered, in flight left out, then Delivered — "not reported" without a
+  provider webhook, "not recorded on the free tier" there —, In progress
+  (sending or waiting for a retry), Failed (for good), No reply (shown when
+  a send was cut off before its reply), Retried (refused attempts sent
+  again), Deferred, Bounced, Complained, Suppressed — each card opens
+  exactly the emails it counts), a period choice (7, 30, 90 or 365 days, or
+  all time; all time when opened for a customer or an order; a search by
+  recipient, type, customer or order says which period it covers and
+  offers **Search all time**), a **By template** table (emails accepted per
+  email type with their open and click rates, and failures for good,
+  premium), **Export CSV**, filter row, paginated list (each row's state,
+  with "retry of #…" / "retried as #…"), and an expand-row detail showing
+  both the open and click history tables with location + device + client
+  per row.
+- **Order detail → Email activity** card: the email summary (emails, a
+  retried one once, with its attempts; accepted by the mail server;
+  delivered only when a provider webhook can report it; sending, retrying,
+  deferred, no reply recorded, failed and suppressed when there are any;
+  opened, clicked, bounced / complained, human vs machine opens),
+  the latest ten rows — "Sending…", "Deferred, retrying", "Sent after 1
+  retry"; consecutive identical machine-likely opens or clicks
   (a mail proxy fetching the pixel again and again) fold into one row with a
-  count — **Open full activity** and **Evidence report (PDF)** (private notes
-  left out). Shown to admins with ReadOrder and ReadCustomer; unlicensed
-  installs see the premium notice.
+  count — **Refresh**, **Open full activity** and **Evidence report (PDF)**
+  (private notes left out). While an email is sending or retrying the card
+  refreshes itself every 10 seconds, for up to 3 minutes. Shown to admins
+  with ReadOrder and ReadCustomer; unlicensed installs see the premium
+  notice.
 - **Order activity page** (Email Log → `/extensions/email-log/orders/:orderId`,
   also linked from Email Log rows): filters, the timeline with classification
   badges ("Unverified" for bare-id hits) and reason chips, approximate
@@ -578,8 +662,10 @@ The free ip-api endpoint logs a warning at boot: it is plain HTTP, limited to
 
 - `GET /email-track/log/export.csv?status=sent&from=2026-05-01` (premium;
   the Email Log's **Export CSV**) — same filters as the list endpoint
-  (`status` takes one status or a comma-separated list, e.g.
-  `sent,delivered`), up to 50 000 rows. Every cell is quoted, with the
+  (`status` takes one stored status or a comma-separated list, e.g.
+  `sent,delivered`; `state` how the send went, e.g. `failed` or
+  `sending,retrying`; `fromDays` a period), up to 50 000 rows, with each
+  row's `state` as the last column. Every cell is quoted, with the
   formula-injection guard, after a UTF-8 byte-order mark. From 0.3.0 to
   0.15.4 this route never answered: `log/:id`, declared first, took it and
   replied 400 "Invalid id".
@@ -742,8 +828,8 @@ SNS call you.
 | `GET` | `/email-track/orders/:orderId/activity.json` | ReadOrder + ReadCustomer, premium | redacted JSON + `timelineSha256` (`null` when filtered); `?filter=`; `?evidence=1[&internalNotes=1]` the PDF's items; `?full=1` (every stored column) also needs `ExportEmailEvidence` |
 | `POST` | `/email-track/orders/:orderId/evidence-link` | ReadOrder + ReadCustomer, premium | a 5-minute signed URL for the PDF; body `{ "internalNotes": true }` to print private notes |
 | `GET` | `/email-track/orders/:orderId/evidence.pdf` | signed URL (`exp`, `uid`, `notes`, `sig`) | the evidence report PDF (403 tampered, widened or expired) |
-| `GET` | `/email-track/log` | admin | paginated list with filters (`status` one or comma-separated) |
-| `GET` | `/email-track/log/summary` | admin | per-status counts and their `total` (MySQL / PostgreSQL) |
+| `GET` | `/email-track/log` | admin | paginated list with filters (`status` stored, `state` how the send went — both one or comma-separated —, `fromDays` days or `all`); rows carry `state`, `attempt`, `retryOf`, `retriedBy` |
+| `GET` | `/email-track/log/summary` | admin | counts per state and their `total`, over the list's filters and period (`fromDays`, default 30, or `all`), plus `deliveryEvents` and `deliveryEventsReason` |
 | `GET` | `/email-track/log/:id` | admin | full detail incl. opens + clicks (`:id` digits only, else 404) |
 | `GET` | `/email-track/log/stats/by-template` | admin, premium | per-template aggregates (MySQL / PostgreSQL) |
 | `GET` | `/email-track/log/export.csv` | admin, premium | CSV export |
