@@ -1,5 +1,5 @@
 import { Permission, RequestContext } from '@vendure/core';
-import { applySecurityHeaders, RateLimiter } from '@huloglobal/vendure-licence-sdk';
+import { applySecurityHeaders, isAdminApiSession, RateLimiter } from '@huloglobal/vendure-licence-sdk';
 import { Request, Response } from 'express';
 import { PROVIDER_SLUGS } from './event-types';
 import { getOptions, hasPremiumAccess, ProviderWebhookOptions } from './options';
@@ -165,8 +165,11 @@ export function requireAdmin(ctx: RequestContext, res: Response, write: boolean 
         res.status(401).json({ error: 'Authentication required' });
         return false;
     }
+    // Vendure 3.8+: a Shop-API session of an administrator must not reach admin REST routes.
     let ok: boolean;
-    if (write === 'order') {
+    if (!isAdminApiSession(ctx)) {
+        ok = false;
+    } else if (write === 'order') {
         ok = ctx.userHasPermissions([Permission.ReadOrder]) && ctx.userHasPermissions([Permission.ReadCustomer]);
     } else {
         const needed = write === 'ops' ? [Permission.SuperAdmin] : write ? [Permission.UpdateCustomer] : [Permission.ReadCustomer];

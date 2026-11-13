@@ -1,6 +1,6 @@
 {
     "name": "@huloglobal/vendure-plugin-email-tracking",
-    "version": "0.16.3",
+    "version": "0.16.4",
     "description": "Track every transactional email a Vendure server sends: sends, deliveries, bounces, opens and clicks as raw events, verified Postmark/SendGrid/Mailgun/SES webhooks, a per-order activity timeline with a PDF evidence report, and an admin UI.",
     "license": "AGPL-3.0-only",
     "author": "Wayne Garrison <wayne@garrison.me.uk>",
@@ -30,7 +30,7 @@
     },
     "dependencies": {
         "graphql-tag": "^2.12.7",
-        "@huloglobal/vendure-licence-sdk": "^0.15.2"
+        "@huloglobal/vendure-licence-sdk": "^0.15.6"
     },
     "peerDependencies": {
         "@nestjs/common": ">=10.0.0",
@@ -40,11 +40,11 @@
         "typeorm": ">=0.3.0"
     },
     "devDependencies": {
-        "@huloglobal/vendure-licence-sdk": "^0.15.2",
-        "@nestjs/common": "^10.0.0",
+        "@huloglobal/vendure-licence-sdk": "^0.15.6",
+        "@nestjs/common": "^12.0.1",
         "@types/nodemailer": "^6.0.0",
-        "@vendure/core": "^3.7.3",
-        "@vendure/email-plugin": "^3.7.3",
+        "@vendure/core": "3.8.2",
+        "@vendure/email-plugin": "3.8.2",
         "nodemailer": "^6.9.0",
         "typeorm": "^0.3.0",
         "typescript": "^5.4.0",
