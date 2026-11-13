@@ -5,6 +5,88 @@ documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) and this project
 adheres to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.17.0] — 2026-11-13
+
+Parity with the WordPress plugin: the core of email tracking is free, the
+bounce webhook is strict, and the suppression list is enforced on every send.
+One new column (`email_log.machineCount`; README → Upgrading to 0.17.0).
+
+### Changed — tiers
+- **Free in every tier:** open and click recording, the suppression list
+  (enforced at send) and the per-order email list on the order page.
+- **Premium:** the weekly email report (the scheduler skips its run without a
+  licence or the evaluation; its settings are kept) and the set-up checklist
+  (`GET /email-track/setup`, the digest preview, test send and settings
+  changes answer 402; `digest/settings` reports `locked`).
+- `PREMIUM_FEATURES` now lists exactly what is gated: per-template rates,
+  CSV export, the order activity timeline and PDF evidence report, provider
+  delivery / deferral / unsubscribe / engagement events, the weekly report,
+  the set-up checklist. It is exported from the package index.
+
+### Fixed
+- **B1 — the bounce webhook is strict and per recipient.** Every status
+  except `complained` used to be recorded as a bounce, so a relay forwarding
+  a delivery or an open put a working address on the suppression list, and a
+  comma-joined To list was suppressed as one string. Now only `bounced` with
+  `bounceType` `hard` / `soft` (and their synonyms) or `complained` is
+  accepted — anything else is 400 and changes nothing; a hard bounce or a
+  complaint suppresses the address the report names (`recipient`, which
+  must be one of the email's recipients) or the email's only recipient, and
+  nobody when several were addressed and none is named. The answer adds
+  `suppressed`. `recordBounceReport()` returns `{ matched, suppressed }`;
+  `recordBounce()` keeps its boolean.
+- **B7 — suppression is enforced in the EmailPlugin pipeline.** It was only
+  checked in `sendTracked()`, and only with premium; `TrackingEmailSender`
+  never checked it. Both paths now drop suppressed addresses (the email is
+  not sent when nobody is left: a `suppressed` row and event, no job retry),
+  in every tier. A password reset is exempt (`suppressionExemptTypes`,
+  default `['password-reset']`), decided by the type the sender gave, never
+  the subject. Suppression rows are always bare lower-cased addresses.
+
+### Added
+- **Email type from the sender.** The plugin wraps the EmailPlugin's send job
+  (AsyncLocalStorage), so `TrackingEmailSender` logs the event handler's type
+  and the order from its template variables instead of guessing from the
+  subject (subject guessing stays only as the label of mail sent outside the
+  job). `withEmailContext()` labels your own sends.
+- **Bot-aware counts.** Opens and clicks classified as machine traffic
+  (scanners, link checkers, bots, and — new — opens from Apple's network,
+  reasons `apple-network` + `ampp`) are recorded but not counted in
+  `openCount` / `clickCount`; `email_log.machineCount` counts them. Image-proxy
+  opens (Gmail, Yahoo, Outlook) still count.
+- **Suppression list admin UI** (search, add with reason and note, remove);
+  `GET /email-track/suppression` takes `q`, `take`, `skip` and returns a real
+  `total`; `POST` accepts exactly one address. The GraphQL mutation
+  validates the same way.
+- **Tracking switches:** track opens / track clicks (`trackOpens`,
+  `trackClicks`, and Email Log → Settings). Off: no pixel / no link
+  rewriting on new mail, nothing recorded for new hits; old links keep
+  working.
+- **Trusted proxies:** `trustedProxies` (IPs / CIDR, IPv4 and IPv6) plus an
+  admin-editable list. When set, proxy headers are believed only from those
+  addresses and `X-Forwarded-For` is walked past them.
+- **Privacy export / erase** by address: `GET /email-track/privacy/export`
+  (ReadCustomer) and `POST /email-track/privacy/erase` `{ email, confirm: true }`
+  (DeleteCustomer), with an admin card. The suppression entry is kept on
+  erase and reported as retained.
+- **Dashboard widget:** a fourth figure, failed or bounced (7 days).
+- **Free order card:** the order's email list (latest 20) with the premium
+  note for the timeline and the evidence report.
+- `GET` / `POST /email-track/settings` (POST: SuperAdmin). A save that cannot
+  be written to `hulo_plugin_prefs` is reported (500), never shown as saved.
+
+### Tests
+- Unit: recipients, strict bounce parsing, per-recipient targets, CIDR /
+  trusted proxies, bot counting, the sender context through the real Vendure
+  `EmailProcessor`, switches, premium digest, B7 on `TrackingEmailSender`.
+- PostgreSQL corpus: every new statement, plus the suppression IN lookup,
+  `machineCount` and privacy export / erase end to end.
+- e2e (sql.js): strict bounces, per-recipient suppression, free suppression
+  at send, suppression admin, switches, privacy, premium reports, the free
+  order list and widget. New MariaDB e2e (`ET_E2E_DB_*`): settings persisted
+  in `hulo_plugin_prefs`, machine counting, suppression + bounce + privacy,
+  the weekly report gate.
+
 ## [0.16.4] — 2026-11-13
 
 ### Security

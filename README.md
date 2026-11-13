@@ -13,6 +13,31 @@ per-customer Emails tab.
 
 Maintained by Wayne Garrison.
 
+## Free and premium (0.17.0)
+
+**Free, in every tier:** the email log with honest send outcomes; open and
+click recording (bot-aware: scanners, link checkers and Apple Mail Privacy
+Protection are recorded but not counted); the suppression list, enforced at
+send for every email (a password reset is still sent) with an admin list to
+search, add and remove; hard-bounce and complaint handling from the bounce
+webhook and from verified provider webhooks (bounces, complaints, drops);
+the per-order email list on the order page and the per-customer Emails tab;
+privacy export / erase by address; the tracking switches and trusted
+proxies; the dashboard widget.
+
+**Premium** (licence, or the 14-day evaluation) — exactly `PREMIUM_FEATURES`:
+
+- Per-template open and click rates
+- CSV export of the email log
+- Order email activity timeline and PDF evidence report
+- Provider delivery, deferral, unsubscribe and engagement events
+- Weekly email report
+- Setup checklist
+
+When a licence lapses the premium features stop (the weekly report is not
+sent, the checklist is not shown); their data and settings are kept and come
+back with a key.
+
 ## Buy
 
 Every install gets a 14-day evaluation with all features on — no card, nothing to start. Then **£6.95/month**,
@@ -61,6 +86,12 @@ export const config: VendureConfig = {
                 rateLimit: { failed: { capacity: 60, windowMs: 60_000 }, verified: { capacity: 1200, windowMs: 60_000 } },
             },
             // trustedIpHeaders: ['cf-connecting-ip'], // only what your proxy sets and strips (see Privacy + safety)
+            // trustedProxies: ['10.0.0.0/8'],         // 0.17.0: headers believed only from these (also editable in Settings)
+
+            // -- Tracking switches + suppression (0.17.0; the switches are also in Email Log → Settings) --
+            trackOpens: true,                         // default true
+            trackClicks: true,                        // default true
+            suppressionExemptTypes: ['password-reset'], // default: a password reset is always sent
 
             // -- IP enrichment (0.16.0, opt-in: no third-party call without it) --
             ipEnrichment: { provider: 'ipinfo', token: process.env.IPINFO_TOKEN!, cacheTtlMs: 86_400_000, maxLookupsPerMinute: 120 },
@@ -79,6 +110,14 @@ Then add the UI extensions to your `compileUiExtensions` config:
 EmailTrackingPlugin.uiExtensions
 ```
 
+
+> **Since 0.17.0:** opens, clicks and the suppression list are free; the
+> weekly report and the set-up checklist are premium. `email_log` has a new
+> `machineCount` column (see Upgrading to 0.17.0). The bounce webhook is
+> strict: only `status: "bounced"` with `bounceType: "hard" | "soft"`, or
+> `status: "complained"`, is accepted (anything else is 400), and it
+> suppresses per recipient. The email type comes from the EmailPlugin event
+> that sent it (`order-confirmation`, `password-reset`, …), not the subject.
 
 > **Since 0.14.2:** the bounce webhook needs `bounceWebhookSecret` (or
 > `allowUnauthenticatedBounceWebhook: true` on a private network); rows are
@@ -258,10 +297,10 @@ a secret exists); the IP is the validated, canonical address (one IP, one
 hash, whatever the notation). Event rows are best-effort: a failed write
 never stops a send, a pixel or a redirect.
 
-Free tier: send outcomes, bounces, complaints and provider drops are
-recorded, as the email log always has; opens, clicks, provider delivered /
-deferred / unsubscribe and engagement events and the order activity views
-need premium access.
+Free tier: send outcomes, opens, clicks (since 0.17.0), bounces,
+complaints and provider drops are recorded; provider delivered / deferred /
+unsubscribe and engagement events and the order activity timeline need
+premium access.
 
 **Status precedence.** `email_log.status` only ever moves up this order,
 whatever order events arrive in: `sent` < `deferred` < `delivered` <
@@ -333,11 +372,19 @@ Every open and click is classified `human_likely`, `machine_likely` or
 `unknown` by the licence SDK's classifier, with reason codes such as
 `gmail-proxy`, `ampp`, `safelinks`, `proofpoint`, `bot-ua`, `headless`,
 `prefetch`, `no-ua` and — with IP enrichment — `datacentre`, `vpn`, `proxy`,
-`tor`. An open or click through an unsigned (bare-id) link is classified
-`unverified` instead — never human or machine — with `unsigned-token` first
-among its reasons (the user-agent reasons follow). The classification is
-advisory: nothing is blocked. With IP enrichment on, the event is classified
-again once the network flags arrive.
+`tor`. Since 0.17.0 an open from Apple's network (17.0.0.0/8) gets
+`apple-network` and `ampp` (Mail Privacy Protection fetches every image as
+the message arrives). An open or click through an unsigned (bare-id) link is
+classified `unverified` instead — never human or machine — with
+`unsigned-token` first among its reasons (the user-agent reasons follow).
+Nothing is blocked: every hit is recorded and every click redirects.
+
+**Counting (0.17.0).** Machine traffic is not counted in `openCount` /
+`clickCount` (nor first-open / first-click): it goes to
+`email_log.machineCount`, so open and click rates are people. Opens whose
+only strong machine signal is an image proxy that loads images when the
+recipient opens the message (Gmail, Yahoo Mail, Outlook) still count — the
+open itself is real. Same rules as the WordPress plugin.
 
 ### Order activity, exports and the evidence report
 
@@ -565,13 +612,65 @@ ipEnrichment: { provider: 'custom', lookup: async ip => ({ country: 'GB', asn: '
 The free ip-api endpoint logs a warning at boot: it is plain HTTP, limited to
 45 requests a minute and licensed for non-commercial use only.
 
-### Suppression list
+### Suppression list (free since 0.17.0)
 
-- New `EmailSuppression` entity. Hard bounces and complaints
-  auto-populate — from `/email-track/bounce` and from verified provider
-  webhooks; `sendTracked()` refuses suppressed recipients and
-  writes `status='suppressed'` rather than calling SMTP.
-- Admin CRUD at `GET/POST/DELETE /email-track/suppression`.
+- `EmailSuppression` entity, one bare lower-cased address per row. Hard
+  bounces and complaints auto-populate — from `/email-track/bounce` and from
+  verified provider webhooks.
+- **Enforced at send in every tier, on both paths:** `TrackingEmailSender`
+  (every EmailPlugin email) and `sendTracked()`. Suppressed addresses are
+  dropped from the To list; with nobody left the email is not sent and a
+  `status='suppressed'` row (and a `suppressed` event) records the attempt —
+  no error, so the email job does not retry. A partly suppressed email is
+  sent to the others and its row notes who was left out.
+- **Exempt:** the types in `suppressionExemptTypes` (default
+  `['password-reset']`), so a customer can always get back into their
+  account. Only a type the sender gave counts (the EmailPlugin event type,
+  or `sendTracked`'s `meta.type`), never one guessed from the subject.
+- **Admin UI:** Email Log → Suppression list (search, add with a reason and
+  note, remove). REST: `GET /email-track/suppression?q=&take=&skip=`
+  (`total` counts every match), `POST` `{ recipient, reason?, note? }`
+  (one address; `manual`, `unsubscribe`, `hard-bounce`, `complaint`),
+  `DELETE /email-track/suppression/:recipient`.
+
+### Email type from the sender (0.17.0)
+
+The type on each log row is the EmailPlugin event handler's type
+(`order-confirmation`, `password-reset`, `email-verification`,
+`email-address-change`, or your own handler's), and the order comes from its
+template variables — the plugin wraps the EmailPlugin's send job so
+`TrackingEmailSender` knows who is sending. Emails sent through an
+EmailSender outside that job fall back to the subject-based label (never
+used for a suppression exemption); label them with
+`withEmailContext({ type, orderId }, () => sender.send(…))`.
+
+### Tracking switches and trusted proxies (0.17.0)
+
+Email Log → Settings: **Track opens** (the pixel) and **Track link clicks**
+(link rewriting), defaults from `trackOpens` / `trackClicks` (true). Off
+stops it at once for new emails and new hits; the pixel and old links keep
+answering, and what was recorded stays until retention removes it.
+**Trusted proxies**: IPs / CIDR ranges (IPv4 and IPv6), added to
+`trustedProxies` from init. When any are set, the `trustedIpHeaders` are
+believed only for a connection from one of them, and in `X-Forwarded-For`
+the visitor is the right-most hop that is not one of them. Stored in
+`hulo_plugin_prefs` (`tracking.opens`, `tracking.clicks`,
+`tracking.trustedProxies`); the server and the worker pick a change up
+within a minute. `GET /email-track/settings`, `POST /email-track/settings`
+`{ trackOpens?, trackClicks?, trustedProxies? }` (SuperAdmin).
+
+### Privacy export / erase (0.17.0)
+
+Email Log → Privacy, or `GET /email-track/privacy/export?email=` (JSON
+download; ReadCustomer) and `POST /email-track/privacy/erase`
+`{ email, confirm: true }` (DeleteCustomer). The export holds the address's
+emails (type, subject, status, opens, clicks, machine hits, the order), their
+events (time, kind, approximate location, client, classification) and its
+suppression entry. Erasing deletes those emails (an email to several
+recipients as a whole), their `email_event` and `email_link` rows and the
+events recorded against the address alone; the suppression entry is kept
+— it is the record that the address must not be emailed — and the answer
+says so (remove it from the list too if it should go).
 
 ### Per-template analytics
 
@@ -580,19 +679,27 @@ The free ip-api endpoint logs a warning at boot: it is plain HTTP, limited to
 
 ### Bounce webhook
 
-- `POST /email-track/bounce` with `{ messageId, status, reason }` as
+- `POST /email-track/bounce` with `{ messageId, status, bounceType, recipient?, reason }` as
   `application/json` (at most 100 KB, gzip or deflate accepted, as before).
   Other content types answer 415, so a web page cannot post a cross-site
   `text/plain` or form request to it; over the rate limit, 429 before the
   body is read.
+- **Strict since 0.17.0** (as the WordPress plugin): `status` must be
+  `bounced` / `bounce` or `complained` / `complaint`, and a bounce must say
+  `bounceType` `hard` (`permanent`) or `soft` (`transient`, `temporary`).
+  Anything else — a relay forwarding deliveries or opens, a provider's own
+  words — is 400 and changes nothing. A hard bounce or a complaint
+  suppresses the address the report names in `recipient` (or `email`; it
+  must be one of the email's recipients, else `matched: false`), or the
+  email's only recipient; an email to several people with no address named
+  suppresses nobody. The answer is `{ ok, matched, suppressed }`.
 - Verifies `X-Signature` (HMAC-SHA256) against `bounceWebhookSecret` or a
   *configured* `signingSecret` (a generated one is never used here, since
   the sender could not know it). Postmaster integrations stay loose-coupled.
 - Since 0.16.0 the HMAC is checked over the exact request bytes (the plugin
   captures the raw body on this route); a signature over the compact JSON
   form, which earlier versions verified, is still accepted.
-- `bounceType: 'soft'` (or `transient`) records a soft bounce and never
-  suppresses. Each call is an event on the timeline.
+- A soft bounce records a `soft-bounce` event and never suppresses. Each call is an event on the timeline.
 
 ### Admin UI
 
@@ -624,8 +731,10 @@ The free ip-api endpoint logs a warning at boot: it is plain HTTP, limited to
   count — **Refresh**, **Open full activity** and **Evidence report (PDF)**
   (private notes left out). While an email is sending or retrying the card
   refreshes itself every 10 seconds, for up to 3 minutes. Shown to admins
-  with ReadOrder and ReadCustomer; unlicensed installs see the premium
-  notice.
+  with ReadOrder and ReadCustomer. The free tier (0.17.0) gets the order's
+  **email list** instead — sent, email type, recipient, status, opens,
+  clicks, the latest 20 — with a note that the timeline and the evidence
+  report are premium.
 - **Order activity page** (Email Log → `/extensions/email-log/orders/:orderId`,
   also linked from Email Log rows): filters, the timeline with classification
   badges ("Unverified" for bare-id hits) and reason chips, approximate
@@ -649,8 +758,14 @@ The free ip-api endpoint logs a warning at boot: it is plain HTTP, limited to
   order and its activity (all seven columns fit a 1280 px screen; narrower,
   the table scrolls inside its card). Email Log rows with a customer but no
   order link to this tab.
+- **Suppression list, Tracking settings and Privacy** (0.17.0, free):
+  three cards under the Email Log list — search / add / remove suppressed
+  addresses; the open and click switches and trusted proxies; export or
+  erase what is held about one address.
+- **Weekly report and set-up checklist** cards show with a licence or the
+  evaluation; the free tier sees one line saying they are premium.
 - **Dashboard widget** — Dashboard → Add widget → **Email Tracking**:
-  emails tracked, opens and clicks for the last 7 days plus a link to the
+  emails tracked, opens, clicks and failed or bounced for the last 7 days plus a link to the
   page.
 - **Licence banner** with the trial countdown, "Email me before it ends",
   the premium feature list, what the plugin has done so far, and an amber
@@ -738,6 +853,12 @@ The report is sent once per install (safe with several workers).
 - Settings live in the shared `hulo_plugin_prefs` table (one row per
   plugin and key), created at boot if missing.
 
+**Premium (0.17.0).** The weekly report and the set-up checklist need a
+licence or the evaluation: without one the report is not sent (the
+scheduler skips its run), `GET /email-track/setup`, the digest preview,
+test send and settings changes answer 402, and `GET /email-track/digest/settings`
+reports `locked: true`. The settings are kept and work again with a key.
+
 **Set-up checklist.** The first card on the Email Log page
 (`GET /email-track/setup`) runs four real checks: the tracking sender is
 wrapped (a log row in the last 30 days), `publicBaseUrl` points at a public
@@ -746,8 +867,8 @@ click has been recorded. Each row has a hint and a docs link; **Hide**
 puts it away in that browser once everything is done, and it comes back if
 a check fails again. The undone items are the weekly report's tips.
 
-**Dashboard widget.** Dashboard → Add widget → **Email Tracking** shows
-emails tracked, opens and clicks for the last 7 days (`GET /email-track/widget`),
+**Dashboard widget** (free). Dashboard → Add widget → **Email Tracking** shows
+emails tracked, opens, clicks and **failed or bounced** (failed for good, bounced or complained) for the last 7 days (`GET /email-track/widget`),
 the licence notice when a trial or key is about to end, and an
 "Open Email Tracking" link. Needs the `ReadCustomer` permission, like the
 page.
@@ -762,11 +883,12 @@ plugin did. `HULO_HEARTBEAT_DISABLED=true` stops the heartbeat as before.
 
 | Permission | Grants |
 | --- | --- |
-| `ReadCustomer` | the Email Log page, its list / detail / summary endpoints, the customer Emails tab, the widget, licence status |
+| `ReadCustomer` | the Email Log page, its list / detail / summary endpoints, the customer Emails tab, the order's email list, the widget, licence status, the suppression list, the tracking settings (read), the privacy export |
 | `UpdateCustomer` | adding and lifting suppressions, weekly-report settings, the trial reminder |
+| `DeleteCustomer` | the privacy erase |
 | `ReadOrder` **and** `ReadCustomer` | order activity, its CSV / JSON exports and the evidence report link |
 | `ExportEmailEvidence` | the full export (`activity.json?full=1`): every stored column, payloads, full user agents. Registered by the plugin (Settings → Roles); SuperAdmin has it |
-| `SuperAdmin` | licence activation / purchase / billing portal, the in-app update |
+| `SuperAdmin` | licence activation / purchase / billing portal, the in-app update, saving the tracking settings |
 
 ## External services
 
@@ -833,18 +955,53 @@ SNS call you.
 | `GET` | `/email-track/log/:id` | admin | full detail incl. opens + clicks (`:id` digits only, else 404) |
 | `GET` | `/email-track/log/stats/by-template` | admin, premium | per-template aggregates (MySQL / PostgreSQL) |
 | `GET` | `/email-track/log/export.csv` | admin, premium | CSV export |
-| `GET` | `/email-track/suppression` | admin | list suppressions |
-| `POST` | `/email-track/suppression` | admin | add a suppression |
-| `DELETE` | `/email-track/suppression/:recipient` | admin | lift a suppression |
+| `GET` | `/email-track/suppression` | admin | list suppressions (`q`, `take`, `skip`; `total`) |
+| `POST` | `/email-track/suppression` | UpdateCustomer | add a suppression (one address) |
+| `DELETE` | `/email-track/suppression/:recipient` | UpdateCustomer | lift a suppression |
+| `GET` | `/email-track/settings` | admin | tracking switches and trusted proxies |
+| `POST` | `/email-track/settings` | SuperAdmin | `{ trackOpens?, trackClicks?, trustedProxies? }` |
+| `GET` | `/email-track/privacy/export?email=` | admin | everything held about one address (JSON) |
+| `POST` | `/email-track/privacy/erase` | DeleteCustomer | `{ email, confirm: true }` — erase its emails and events (suppression kept) |
 | `GET` | `/email-track/status` | admin | version + licence + update status |
 | `GET` | `/email-track/licence/status` | admin | licence/evaluation state, lifecycle notice, premium features, recent stats |
 | `POST` | `/email-track/eval/remind-me` | admin | `{ email }` — trial-ending reminder opt-in |
-| `GET` | `/email-track/setup` | admin | set-up checklist |
-| `GET` | `/email-track/widget` | admin | dashboard widget figures (7 days) |
-| `GET` | `/email-track/digest/settings` | admin | weekly report settings |
-| `POST` | `/email-track/digest/settings` | admin | `{ enabled?, recipient? }` |
-| `POST` | `/email-track/digest/send-test` | admin | `{ to? }` — send this week's report now |
-| `GET` | `/email-track/digest/preview` | admin | this week's report as HTML |
+| `GET` | `/email-track/setup` | admin, premium | set-up checklist |
+| `GET` | `/email-track/widget` | admin | dashboard widget figures (7 days, incl. failed or bounced) |
+| `GET` | `/email-track/digest/settings` | admin | weekly report settings (`locked` without premium) |
+| `POST` | `/email-track/digest/settings` | admin, premium | `{ enabled?, recipient? }` |
+| `POST` | `/email-track/digest/send-test` | admin, premium | `{ to? }` — send this week's report now |
+| `GET` | `/email-track/digest/preview` | admin, premium | this week's report as HTML |
+
+## Upgrading to 0.17.0
+
+One new column, `email_log.machineCount` (int, default 0). Hosts with
+`synchronize: true` get it automatically; otherwise add it before the
+upgrade:
+
+```sql
+-- MySQL / MariaDB
+ALTER TABLE `email_log` ADD `machineCount` int NOT NULL DEFAULT 0;
+-- PostgreSQL
+ALTER TABLE "email_log" ADD "machineCount" integer NOT NULL DEFAULT 0;
+```
+
+Behaviour changes to check:
+
+- **Bounce webhook:** a relay that posts `status: "bounced"` without
+  `bounceType` now gets 400 — add `bounceType: "hard"` or `"soft"`. Other
+  statuses (`delivered`, `opened`, …) were wrongly recorded as bounces before
+  and are now refused.
+- **Suppression is enforced for every install** (it was premium). Review
+  Email Log → Suppression list after upgrading: addresses added while it was
+  not enforced now stop mail to them (a password reset is still sent).
+- **Open and click counts** leave out machine traffic from now on (existing
+  counts are not rewritten).
+- **Email types** of EmailPlugin mail come from the event handler; a type
+  that was guessed from the subject may read differently on new rows (e.g.
+  `password-reset` instead of `email-verification` for a subject that said
+  "verify your password").
+- **Free tier:** the weekly report stops and the checklist is hidden without
+  a licence or the evaluation; opens, clicks and the suppression list are on.
 
 ## Upgrading to 0.16.0
 
