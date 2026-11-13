@@ -5,10 +5,11 @@ import { FormsModule } from '@angular/forms';
 import { HttpClientModule } from '@angular/common/http';
 import { EmailLogComponent } from './components/email-log.component';
 import { OrderActivityPageComponent } from './components/order-activity-page.component';
+import { EmailTrackingToolsComponent } from './components/email-tracking-tools.component';
 
 @NgModule({
     imports: [
-        SharedModule, FormsModule, HttpClientModule,
+        SharedModule, FormsModule, HttpClientModule, EmailTrackingToolsComponent,
         RouterModule.forChild([
             { path: '', pathMatch: 'full', component: EmailLogComponent, data: { breadcrumb: 'Email Log' } },
             {

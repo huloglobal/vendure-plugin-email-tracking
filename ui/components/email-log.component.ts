@@ -166,6 +166,10 @@ interface EmailDetail extends EmailRow {
             </div>
         </vdr-page-block>
 
+        <vdr-page-block *ngIf="reportsLocked && !lockedCustomerId">
+            <div class="unlock-chip">🔒 The weekly email report and the set-up checklist are premium features — <a class="hulo-link" (click)="scrollToLicence()">subscribe or activate a key</a> at the top of this page. Open and click tracking, the suppression list and the per-order email lists stay free.</div>
+        </vdr-page-block>
+
         <vdr-page-block *ngIf="showSetup() || digest">
             <div class="hulo-setup-grid" [class.single]="!showSetup()">
                 <div class="hulo-card" *ngIf="showSetup()">
@@ -454,6 +458,10 @@ interface EmailDetail extends EmailRow {
                 </div>
             </div>
         </vdr-page-block>
+
+        <vdr-page-block *ngIf="!lockedCustomerId">
+            <hulo-email-tracking-tools></hulo-email-tracking-tools>
+        </vdr-page-block>
     `,
     styles: [`
         .lic-banner { display:flex; gap:12px; align-items:center; justify-content:space-between; flex-wrap:wrap; padding:12px 16px; border-radius:10px; font-size:13px; background:var(--gb-tint-warn, #fef3c7); border:1px solid var(--gb-line-warn, #fcd34d); }
@@ -662,6 +670,8 @@ export class EmailLogComponent implements OnInit, OnDestroy {
     setup: { items: Array<{ key: string; label: string; done: boolean; hint: string; tab?: string; url?: string }>; complete: boolean } | null = null;
     setupHidden = false;
     digest: any = null;
+    /** Free tier: the weekly report and the set-up checklist are premium (0.17.0), so neither is loaded. */
+    reportsLocked = false;
     digestRecipient = '';
     digestSaving = false;
     digestTesting = false;
@@ -972,7 +982,9 @@ export class EmailLogComponent implements OnInit, OnDestroy {
                 this.licActivating = false;
                 this.licKeyInput = '';
                 this.notify.success(r?.message || 'Licence activated — all features enabled');
-                this.loadLicMeta(() => { if (this.licMeta?.tier !== 'free') this.loadByTemplate(); });
+                this.loadLicMeta(() => {
+                    if (this.licMeta?.tier !== 'free') { this.byTemplateLocked = false; this.reportsLocked = false; this.loadByTemplate(); this.loadSetup(); this.loadDigest(); }
+                });
                 this.cdr.markForCheck();
             },
             error: e => {
@@ -986,9 +998,10 @@ export class EmailLogComponent implements OnInit, OnDestroy {
     ngOnInit() {
         this.checkClaim(false);
         // Per-template rates are premium: an unlicensed install gets the notice without the request (and its 402).
+        // The weekly report and the set-up checklist are premium too (0.17.0).
         this.loadLicMeta(() => {
-            if (this.licMeta?.tier === 'free') { this.byTemplateLocked = true; this.cdr.markForCheck(); }
-            else this.loadByTemplate();
+            if (this.licMeta?.tier === 'free') { this.byTemplateLocked = true; this.reportsLocked = true; this.cdr.markForCheck(); }
+            else { this.loadByTemplate(); this.loadSetup(); this.loadDigest(); }
         });
         const cId = this.route.snapshot.queryParamMap.get('customerId');
         if (cId) {
@@ -999,8 +1012,6 @@ export class EmailLogComponent implements OnInit, OnDestroy {
         if (oCode) this.filterOrderCode = oCode;
         // Opened for one customer or order: every email of theirs, whenever it was sent.
         if (cId || oCode) this.filterDays = this.initialDays = null;
-        this.loadSetup();
-        this.loadDigest();
         this.load();
     }
 

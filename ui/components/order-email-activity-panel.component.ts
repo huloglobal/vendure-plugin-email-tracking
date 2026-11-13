@@ -4,7 +4,7 @@ import { CustomDetailComponent, NotificationService, PermissionsService, SharedM
 import { Observable, Subscription } from 'rxjs';
 import {
     ActivityItem, ActivityPage, classLabel, clientLabel, collapseRuns, EmailTrackingHttp, EmailTrackingTier, emailsInProgress, errorMessage, iconFor,
-    isUnsigned, locationLabel, openEvidenceReport, PanelRow, toneFor,
+    isUnsigned, locationLabel, openEvidenceReport, PanelRow, stateLabel, toneFor,
 } from './activity-shared';
 
 /**
@@ -14,8 +14,10 @@ import {
  * reading up to four pages of 100 to fill the ten rows),
  * a link to the full activity page and the PDF evidence report (private
  * order notes left out; the full page offers to include them). Hidden for
- * admins without ReadOrder and ReadCustomer; unlicensed installs see the
- * premium notice, never an error, and no premium request is made for them.
+ * admins without ReadOrder and ReadCustomer. The free tier (0.17.0) gets the
+ * order's email list instead (sent, to, status, opens, clicks) with a note
+ * that the timeline and the evidence report are premium; no premium request
+ * is made for it.
  *
  * Emails are counted once each (a retried email is one email): accepted by
  * the mail server, and delivered only where a provider webhook can report
@@ -32,10 +34,33 @@ import {
     template: `
         <vdr-card title="Email activity" *ngIf="allowed">
             <div *ngIf="state === 'loading'" class="et-muted" role="status">Loading email activity…</div>
-            <div *ngIf="state === 'locked'" class="et-locked">
-                Order email activity is a premium feature —
-                <a [routerLink]="['/extensions', 'email-log']">subscribe or activate a key</a> on the Email Log page.
-            </div>
+            <ng-container *ngIf="state === 'list'">
+                <table class="table et-emails" *ngIf="emails.length; else noEmailsTpl" aria-label="Emails sent for this order">
+                    <thead><tr><th>Sent</th><th>Email</th><th>To</th><th>Status</th><th>Opens</th><th>Clicks</th></tr></thead>
+                    <tbody>
+                        <tr *ngFor="let e of emails">
+                            <td><time [attr.datetime]="e.createdAt">{{ e.createdAt | localeDate:'short' }}</time></td>
+                            <td [title]="e.subject || ''">{{ e.type }}</td>
+                            <td class="et-to">{{ e.recipient }}</td>
+                            <td [ngClass]="listTone(e.state || e.status)">{{ stateText(e.state || e.status) }}</td>
+                            <td>{{ e.openCount || 0 }}</td>
+                            <td>{{ e.clickCount || 0 }}</td>
+                        </tr>
+                    </tbody>
+                </table>
+                <ng-template #noEmailsTpl><p class="et-muted">No emails for this order yet.</p></ng-template>
+                <p class="et-muted et-small" *ngIf="emailsTotal > emails.length">Showing the latest {{ emails.length }} of {{ emailsTotal }}.</p>
+                <div class="et-locked et-small">
+                    The full activity timeline (deliveries, each open and click, the order's own history) and the PDF evidence report are premium —
+                    <a [routerLink]="['/extensions', 'email-log']">subscribe or activate a key</a> on the Email Log page.
+                </div>
+                <div class="et-actions">
+                    <button type="button" class="btn btn-sm btn-secondary" (click)="refresh()">
+                        <clr-icon shape="refresh" aria-hidden="true"></clr-icon> Refresh
+                    </button>
+                    <a class="btn btn-sm btn-secondary" [routerLink]="['/extensions', 'email-log']" [queryParams]="{ orderCode: orderCode }" *ngIf="orderCode">Open in Email Log</a>
+                </div>
+            </ng-container>
             <div *ngIf="state === 'error'" class="et-muted" role="alert">
                 {{ error }}
                 <button type="button" class="btn btn-sm btn-link" (click)="refresh()">Try again</button>
@@ -118,6 +143,8 @@ import {
         :host-context([data-theme='dark']) .et-locked { background: #451a03; border-color: #b45309; color: #fde68a; }
         :host-context([data-theme='dark']) .et-locked a { color: #fde68a; }
         .et-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+        .et-emails { width: 100%; font-size: 12.5px; margin: 0 0 8px; }
+        .et-to { word-break: break-all; }
     `],
 })
 export class OrderEmailActivityPanelComponent implements CustomDetailComponent, OnInit, OnDestroy {
@@ -142,7 +169,18 @@ export class OrderEmailActivityPanelComponent implements CustomDetailComponent, 
     refreshing = false;
     /** The refresh in flight was the poll's: its failure stops the polling without a message. */
     private quietRefresh = false;
-    state: 'loading' | 'ready' | 'locked' | 'error' = 'loading';
+    /** `list`: the free tier's per-order email list (0.17.0); the timeline is premium. */
+    state: 'loading' | 'ready' | 'list' | 'error' = 'loading';
+    emails: any[] = [];
+    emailsTotal = 0;
+    orderCode: string | null = null;
+    readonly stateText = stateLabel;
+    listTone(s: string): string {
+        if (s === 'failed' || s === 'bounced' || s === 'complained') return 'et-tone-bad';
+        if (s === 'deferred' || s === 'retrying' || s === 'sending' || s === 'unknown') return 'et-tone-warn';
+        if (s === 'sent' || s === 'delivered') return 'et-tone-good';
+        return '';
+    }
     error = '';
     /** The endpoints need ReadOrder AND ReadCustomer; without both the panel is not shown at all. */
     allowed = false;
@@ -174,6 +212,7 @@ export class OrderEmailActivityPanelComponent implements CustomDetailComponent, 
         this.sub = this.entity$?.subscribe(order => {
             if (!order?.id || String(order.id) === this.orderId) return;
             this.orderId = String(order.id);
+            this.orderCode = order.code ? String(order.code) : null;
             if (this.allowed) this.load();
         });
     }
@@ -187,14 +226,34 @@ export class OrderEmailActivityPanelComponent implements CustomDetailComponent, 
         this.refreshing = false;
         this.state = 'loading';
         this.cdr.markForCheck();
-        // Unlicensed: the notice, without a premium request (and its 402) being made.
+        // Free tier: the order's emails (free since 0.17.0), without a premium request (and its 402) being made.
         this.tier.premium$().subscribe(premium => {
             if (premium === false) {
-                this.state = 'locked';
-                this.cdr.markForCheck();
+                this.fetchList();
                 return;
             }
             this.fetchPage(null, 1, [], null);
+        });
+    }
+
+    /** The free per-order email list: `GET /email-track/log?orderId=` (every state, all time, latest 20). */
+    private fetchList() {
+        const forOrder = this.orderId;
+        this.http.get<{ items: any[]; total: number }>(`/email-track/log?orderId=${encodeURIComponent(this.orderId || '')}&fromDays=all&take=20`).subscribe({
+            next: r => {
+                if (this.orderId !== forOrder) return;
+                this.emails = r?.items || [];
+                this.emailsTotal = r?.total || 0;
+                this.state = 'list';
+                this.refreshing = false;
+                this.cdr.markForCheck();
+            },
+            error: e => {
+                if (this.orderId !== forOrder) return;
+                this.state = 'error';
+                this.error = errorMessage(e, 'Loading the order emails');
+                this.cdr.markForCheck();
+            },
         });
     }
 
@@ -279,8 +338,10 @@ export class OrderEmailActivityPanelComponent implements CustomDetailComponent, 
                     this.stopPolling();
                     if (!this.quietRefresh) this.notify.error(errorMessage(e, 'Refreshing email activity'));
                 } else if (e?.status === 402) {
+                    // The licence lapsed since the tier was read: the free list instead.
                     this.stopPolling();
-                    this.state = 'locked';
+                    this.fetchList();
+                    return;
                 } else {
                     this.state = 'error';
                     this.error = errorMessage(e, 'Loading email activity');
