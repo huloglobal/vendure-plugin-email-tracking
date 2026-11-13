@@ -18,6 +18,7 @@ import { EmailLog } from './email-log.entity';
 import { EmailSuppression } from './email-suppression.entity';
 import { EmailTrackingService } from './email-tracking.service';
 import { getLicenceStatus, hasPremiumAccess } from './options';
+import { isAddress, normaliseAddress } from './recipients';
 
 export const emailTrackingAdminApiSchema = gql`
     type HuloEmailLog {
@@ -194,7 +195,7 @@ export class EmailTrackingAdminResolver {
         const n = Math.min(Math.max(Number(take) || 200, 1), 1000);
         const repo = this.connection.rawConnection.getRepository(EmailSuppression);
         const items = recipient
-            ? await repo.find({ where: { recipient: String(recipient).toLowerCase() }, take: n, order: { id: 'DESC' } })
+            ? await repo.find({ where: { recipient: normaliseAddress(recipient) || String(recipient).toLowerCase() }, take: n, order: { id: 'DESC' } })
             : await repo.find({ take: n, order: { id: 'DESC' } });
         return { items, totalItems: items.length };
     }
@@ -203,8 +204,10 @@ export class EmailTrackingAdminResolver {
     @Allow(Permission.UpdateCustomer)
     async huloAddEmailSuppression(@Ctx() ctx: RequestContext, @Args('input') input: any): Promise<any> {
         if (!input?.recipient || !input?.reason) throw new Error('recipient and reason are required');
+        if (!isAddress(String(input.recipient).trim())) throw new Error('recipient must be one email address');
+        if (!['hard-bounce', 'complaint', 'manual', 'unsubscribe'].includes(String(input.reason))) throw new Error('reason must be hard-bounce, complaint, manual or unsubscribe');
         const row = await this.tracking.addSuppression(
-            String(input.recipient),
+            normaliseAddress(String(input.recipient)),
             String(input.reason),
             input.note ? String(input.note) : undefined,
             input.channelId ? Number(input.channelId) : undefined,

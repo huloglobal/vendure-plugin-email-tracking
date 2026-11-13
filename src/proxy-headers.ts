@@ -1,4 +1,6 @@
 import { Request } from 'express';
+import { isIP } from 'net';
+import { inRanges, normaliseIp } from './tracking-settings';
 
 /**
  * Reverse-proxy aware visitor IP extraction.
@@ -40,8 +42,9 @@ function clientFromXff(raw: string): string {
  * any peer lets a client spoof its address to dodge the per-IP limiter
  * and poison the stored open/click IPs.
  */
-export function getRealIp(req: Request, trusted: TrustedIpHeader[] = []): string | null {
+export function getRealIp(req: Request, trusted: TrustedIpHeader[] = [], proxies: string[] = []): string | null {
     const headers = req.headers || {};
+    if (trusted.length && proxies.length) return ipBehindProxies(req, trusted, proxies);
     for (const name of trusted) {
         const raw = String(headers[name] || '').trim();
         if (!raw) continue;
@@ -87,4 +90,36 @@ export function getResolvedRegion(req: Request): string | null {
     const cf = String(headers['cf-region-code'] || '').trim().toUpperCase();
     if (cf && /^[A-Z0-9]{1,4}$/.test(cf)) return cf;
     return null;
+}
+
+/**
+ * With trusted proxies configured (0.17.0, `trustedProxies`): the socket
+ * peer is the visitor unless it is one of the proxies. From a proxy, the
+ * first trusted header that holds a valid address names the visitor; in
+ * `X-Forwarded-For` that is the right-most hop that is not a trusted proxy
+ * (a malformed hop stops the walk: the peer is used). Same rules as the
+ * WordPress plugin.
+ */
+function ipBehindProxies(req: Request, trusted: TrustedIpHeader[], proxies: string[]): string | null {
+    const peerRaw = String((req as any).socket?.remoteAddress || (req as any).connection?.remoteAddress || (req as any).ip || '');
+    const peer = isIP(normaliseIp(peerRaw)) ? normaliseIp(peerRaw) : '';
+    if (!peer) return null;
+    if (!inRanges(peer, proxies)) return peer.slice(0, 64);
+    const headers = req.headers || {};
+    for (const name of trusted) {
+        const raw = String(headers[name] || '').trim();
+        if (!raw) continue;
+        if (name === 'x-forwarded-for') {
+            const hops = raw.split(',').map(h => h.trim()).reverse();
+            for (const hop of hops) {
+                const h = normaliseIp(hop);
+                if (!isIP(h)) return peer.slice(0, 64);
+                if (!inRanges(h, proxies)) return h.slice(0, 64);
+            }
+            return peer.slice(0, 64);
+        }
+        const v = normaliseIp(raw);
+        if (isIP(v)) return v.slice(0, 64);
+    }
+    return peer.slice(0, 64);
 }

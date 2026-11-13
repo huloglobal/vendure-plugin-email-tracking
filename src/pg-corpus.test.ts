@@ -22,7 +22,10 @@ import { createDbAdapter, translateSql } from '@huloglobal/vendure-licence-sdk';
 vi.mock('./email-log.entity', () => ({ EmailLog: class EmailLog {} }));
 vi.mock('./email-suppression.entity', () => ({ EmailSuppression: class EmailSuppression {} }));
 vi.mock('./email-event.entity', () => ({ EmailEvent: class EmailEvent {} }));
-import { batchedDelete } from './email-tracking.service';
+import { batchedDelete, EmailTrackingService } from './email-tracking.service';
+import { findSuppressed } from './suppression-store';
+import { recipientHash } from './email-event.service';
+import { eventHashKey } from './options';
 import { EmailEventService } from './email-event.service';
 import { applyStatusChange, nextStatus, STATUS_RANK, statusChangeForEvent } from './event-types';
 import { databaseClockSkewMinutes } from './db-clock';
@@ -78,7 +81,8 @@ const DDL = [
         "clickCount" INTEGER NOT NULL DEFAULT 0,
         "clicksJson" TEXT,
         "firstClickedAt" TIMESTAMP,
-        tracked BOOLEAN NOT NULL DEFAULT TRUE
+        tracked BOOLEAN NOT NULL DEFAULT TRUE,
+        "machineCount" INTEGER NOT NULL DEFAULT 0
     )`,
     `CREATE TABLE email_link (
         id SERIAL PRIMARY KEY,
@@ -165,6 +169,7 @@ const SEED = [
 /** Stand-in for a `${expr}` interpolation inside an SQL template literal. */
 function standIn(expr: string): string {
     const e = expr.trim();
+    if (e === 'suppressionWhere') return ' WHERE recipient LIKE ?';
     if (/^(w|\w*Clause)$/.test(e)) return ' WHERE `customerId` = ? AND recipient LIKE ? AND `createdAt` >= ?';
     // The shared fragments of send-attempts.ts, as they are.
     if (/^(columns|ATTEMPT_COLUMNS)$/.test(e)) return ATTEMPT_COLUMNS;
@@ -506,4 +511,42 @@ describe.skipIf(!PG_URL)('Postgres SQL corpus (HULO_PG_URL)', () => {
         }
         expect(wrong).toEqual([]);
     }, 60_000);
+
+    it('0.17.0: the suppression IN lookup, the machine counter and the privacy export / erase on PostgreSQL', async () => {
+        const db = createDbAdapter(raw);
+        await client.query('BEGIN');
+        try {
+            await client.query(`INSERT INTO email_suppression (recipient, reason) VALUES ('gone@example.com', 'manual')`);
+            expect(await findSuppressed((sql, p) => db.query(sql, p), ['GONE@example.com', 'here@example.com'])).toEqual(['gone@example.com']);
+
+            const ins = async (recipient: string) => (await client.query(
+                `INSERT INTO email_log (type, recipient, subject, status) VALUES ('t', $1, 's', 'sent') RETURNING id`, [recipient])).rows[0].id;
+            const a = await ins('p1@example.com');
+            const b = await ins('x@y.com, P1@example.com');
+            const c = await ins('p1@example.com.au');
+            await db.query('UPDATE email_log SET `machineCount` = `machineCount` + 1 WHERE id = ?', [a], { needAffected: true });
+            expect((await client.query('SELECT "machineCount" FROM email_log WHERE id = $1', [a])).rows[0].machineCount).toBe(1);
+            for (const id of [a, b, c]) {
+                await client.query(`INSERT INTO email_event ("emailLogId", type, source, "occurredAt") VALUES ($1, 'open', 'pixel', NOW())`, [id]);
+            }
+            await client.query(`INSERT INTO email_event (type, source, "occurredAt", "recipientHash") VALUES ('suppressed', 'admin', NOW(), $1)`,
+                [recipientHash('p1@example.com', eventHashKey())]);
+            await client.query(`INSERT INTO email_suppression (recipient, reason) VALUES ('p1@example.com', 'manual')`);
+
+            const repo = { findOne: async ({ where }: any) => (await client.query('SELECT * FROM email_suppression WHERE recipient = $1', [where.recipient])).rows[0] || null };
+            const conn: any = { rawConnection: { ...raw, getRepository: () => repo } };
+            const svc = new EmailTrackingService(conn, { isWorker: false } as any, new EmailEventService(conn));
+            const exp = await svc.privacyExport('P1@example.com');
+            expect(exp!.emails.map(e => e.id).sort()).toEqual([a, b].sort());
+            expect(exp!.events.length).toBe(3);
+            expect(exp!.suppression).toMatchObject({ recipient: 'p1@example.com', reason: 'manual' });
+
+            const erased = await svc.privacyErase('p1@example.com');
+            expect(erased).toMatchObject({ emails: 2, events: 3, suppressionRetained: true });
+            const left = (await client.query('SELECT id FROM email_log WHERE id IN ($1, $2, $3)', [a, b, c])).rows.map((r: any) => r.id);
+            expect(left).toEqual([c]);
+        } finally {
+            await client.query('ROLLBACK');
+        }
+    }, 30_000);
 });

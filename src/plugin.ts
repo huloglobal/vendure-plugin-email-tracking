@@ -18,6 +18,7 @@ import { EmailProviderWebhookController } from './email-provider-webhook.control
 import { exportEmailEvidencePermission } from './permissions';
 import { bounceBodyMiddleware, providerWebhookBodyMiddleware } from './raw-body';
 import { databaseClockSkewMinutes } from './db-clock';
+import { installEmailProcessorHook } from './email-context';
 
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const PKG_VERSION: string = require('../package.json').version;
@@ -195,6 +196,8 @@ export class EmailTrackingPlugin {
 
     static init(options: EmailTrackingPluginOptions): Type<EmailTrackingPlugin> {
         setOptions(options);
+        // The EmailPlugin's send job carries its event type and order to TrackingEmailSender (email-context.ts).
+        installEmailProcessorHook();
         EmailTrackingPlugin.initLicenceKey = options.licenceKey;
 
         // Warn if @vendure/core at runtime is outside the tested
@@ -235,7 +238,7 @@ export class EmailTrackingPlugin {
             // eslint-disable-next-line no-console
             console.warn(
                 `[@huloglobal/vendure-plugin-email-tracking] ${status.message}` +
-                ` — Running in FREE tier: opens + clicks NOT recorded, suppression list NOT enforced at send, per-template stats + CSV export disabled, order email activity + evidence report disabled, provider delivered/deferred/unsubscribe and engagement events NOT recorded (bounces, complaints and drops still are). Buy a licence at https://elite.charity/licence/buy/${PLUGIN_ID}`,
+                ` — Running in FREE tier: the email log, open + click recording, the suppression list, per-order and per-customer email lists, bounces, complaints and drops, privacy export / erase stay on; per-template stats, CSV export, the order activity timeline + evidence report, provider delivered/deferred/unsubscribe and engagement events, the weekly report and the setup checklist are off. Buy a licence at https://elite.charity/licence/buy/${PLUGIN_ID}`,
             );
         }
 

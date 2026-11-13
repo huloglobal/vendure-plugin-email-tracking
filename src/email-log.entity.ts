@@ -131,6 +131,14 @@ export class EmailLog extends VendureEntity {
     @Column({ type: Date, nullable: true })
     firstClickedAt!: Date;
 
+    /**
+     * Opens and clicks classified as machine traffic (0.17.0: security
+     * scanners, link checkers, Apple Mail Privacy Protection, bots): recorded
+     * on the event timeline but not counted in `openCount` / `clickCount`.
+     */
+    @Column({ type: 'int', default: 0 })
+    machineCount!: number;
+
     /** Whether the email was sent via our "tracked" pipeline at all.
      * Always true for emails created by the service; left as a guard
      * for any future direct-insert tooling. */

@@ -26,3 +26,9 @@ export { exportEmailEvidencePermission } from './permissions';
 export { IpEnrichmentOptions, IpEnrichmentResult } from './ip-enrichment';
 export { EmailEventType, EmailEventSource, EventClassification, STATUS_RANK, nextStatus } from './event-types';
 export { TimelineItem, TimelineFilter } from './timeline';
+// 0.17.0 — sender context, suppression helpers, tracking settings
+export { withEmailContext, currentEmailContext, EmailSendContext } from './email-context';
+export { DEFAULT_SUPPRESSION_EXEMPT_TYPES, normaliseAddress, splitRecipients, parseBounceBody } from './recipients';
+export { trackingSwitches, TrackingSettings } from './tracking-settings';
+export { classifyEngagement, engagementCounts } from './engagement-class';
+export { PREMIUM_FEATURES } from './email-tracking.service';

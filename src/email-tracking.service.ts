@@ -9,13 +9,18 @@ import * as nodemailer from 'nodemailer';
 import { EmailLog, EmailLogStatus } from './email-log.entity';
 import { EmailSuppression } from './email-suppression.entity';
 import { lookupGeo } from './geo-lookup';
-import { getLicenceStatus, getOptions, hasPremiumAccess, getEvalState, configuredSigningSecret, setStatsProvider } from './options';
+import { getLicenceStatus, getOptions, hasPremiumAccess, getEvalState, configuredSigningSecret, setStatsProvider, eventHashKey } from './options';
 import { parseEmailClient } from './parse-ua';
 import { EmailEventService } from './email-event.service';
 import { correlationHeaders, mergeHeaders, providerMessageIdFromSmtpReply, sendPayload, wrapTrackedHtml } from './outgoing-mail';
 import { findLink, LinkMeta, redactSensitiveUrl } from './link-meta';
 import { dedupeKeyFor } from './webhook-mappers';
 import { ACCEPTED_SQL, ATTEMPT_COLUMNS, attemptInfosFor, replyCode, SendClock, sendClock, TimelineStart, unsettledSince } from './send-attempts';
+import { classifyEngagement, engagementCounts } from './engagement-class';
+import { DEFAULT_SUPPRESSION_EXEMPT_TYPES, isSuppressionExempt, normaliseAddress, splitRecipients, suppressionTargets } from './recipients';
+import { findSuppressed, partialSuppressionNote, SUPPRESSED_NOTE } from './suppression-store';
+import { applyStoredPrefs, settingsPatch, trackingSwitches } from './tracking-settings';
+import { recipientHash } from './email-event.service';
 
 const loggerCtx = 'EmailTrackingService';
 
@@ -24,14 +29,23 @@ export const PLUGIN_SHORT_ID = 'vendure-plugin-email-tracking';
 export const PLUGIN_DISPLAY_NAME = 'Email Tracking';
 export const ADMIN_ROUTE = 'email-log';
 
-/** What the free tier loses — shown in the trial/free banners and the digest. */
+/**
+ * What the free tier does not include — exactly the features gated by
+ * `hasPremiumAccess()` (0.17.0). Shown in the trial / free banners and the
+ * weekly report, and the source for the marketing TIERS list. Everything
+ * else is free: the email log with send outcomes, open and click recording
+ * (bot-aware), the suppression list enforced at send, the per-order and
+ * per-customer email lists, bounce / complaint / bad-address-drop handling
+ * (bounce webhook and provider webhooks), privacy export / erase, the
+ * tracking switches and trusted proxies, the dashboard widget.
+ */
 export const PREMIUM_FEATURES = [
-    'Open and click tracking',
     'Per-template open and click rates',
-    'CSV export',
-    'Suppression list',
-    'Order email activity and evidence report',
-    'Provider delivery, deferral and unsubscribe events',
+    'CSV export of the email log',
+    'Order email activity timeline and PDF evidence report',
+    'Provider delivery, deferral, unsubscribe and engagement events',
+    'Weekly email report',
+    'Setup checklist',
 ];
 
 /** SQLite family (tests, local dev): Date parameters are bound as UTC strings there. */
@@ -170,7 +184,7 @@ export function buildSetupItems(f: SetupFacts): SetupChecklist {
             key: 'engagement', label: 'First open or click recorded', done: f.hasEngagement,
             hint: f.hasEngagement
                 ? 'Opens and clicks are being recorded.'
-                : 'Recorded once a customer opens a tracked email or clicks a link in it. Needs an active licence or the evaluation — the free tier serves the pixel but does not record.',
+                : 'Recorded once a customer opens a tracked email or clicks a link in it (Settings on the Email Log page: open and click tracking switched on).',
         },
     ];
     return { items, complete: items.every(i => i.done) };
@@ -248,10 +262,43 @@ export async function batchedDelete(
     return total;
 }
 
+/**
+ * The weekly report is premium (0.17.0): the scheduler skips its run while
+ * neither a licence nor the evaluation is active, so the report stops when a
+ * licence lapses and resumes with a key. Its settings are kept.
+ */
+export class PremiumWeeklyDigest extends WeeklyDigest {
+    constructor(opts: ConstructorParameters<typeof WeeklyDigest>[0], private readonly premium: () => boolean = hasPremiumAccess) {
+        super(opts);
+    }
+
+    async tick(now: Date = new Date()): Promise<boolean> {
+        if (!this.premium()) return false;
+        return super.tick(now);
+    }
+}
+
+/** Rows read per privacy export (newest first). */
+export const PRIVACY_EXPORT_ROWS = 2000;
+/** email_log rows erased per statement batch. */
+const PRIVACY_ERASE_CHUNK = 200;
+/** Candidate rows read per erase / export round (the LIKE pre-filter). */
+const PRIVACY_SCAN = 5000;
+
+export interface PrivacyExport {
+    email: string;
+    generatedAt: string;
+    emails: Array<Record<string, unknown>>;
+    events: Array<Record<string, unknown>>;
+    suppression: Record<string, unknown> | null;
+    truncated: boolean;
+}
+
 @Injectable()
 export class EmailTrackingService implements OnApplicationBootstrap, OnModuleDestroy {
     private retentionTimer: NodeJS.Timeout | null = null;
     private retentionFirst: NodeJS.Timeout | null = null;
+    private settingsTimer: NodeJS.Timeout | null = null;
     /** Shared `hulo_plugin_prefs` rows for this plugin (digest settings, trial lead). */
     readonly prefs: PluginPrefs;
     /** Monday 08:00 (server-local) "what Email Tracking did for you" report. */
@@ -271,7 +318,7 @@ export class EmailTrackingService implements OnApplicationBootstrap, OnModuleDes
         this.events = events ?? new EmailEventService(connection);
         const query = (sql: string, params?: any[], o?: any) => adapterFor(this.connection.rawConnection).query(sql, params, o);
         this.prefs = new PluginPrefs(query, PLUGIN_SHORT_ID);
-        this.digest = new WeeklyDigest({
+        this.digest = new PremiumWeeklyDigest({
             pluginId: PLUGIN_SHORT_ID,
             pluginName: PLUGIN_DISPLAY_NAME,
             prefs: this.prefs,
@@ -288,7 +335,10 @@ export class EmailTrackingService implements OnApplicationBootstrap, OnModuleDes
         // Usage stats (30 days, numbers only) for the evaluation ping and the
         // heartbeat — both server and worker may answer, so wire it everywhere.
         setStatsProvider(() => this.evalStats());
-        void this.prefs.ensureTable();
+        void this.prefs.ensureTable().then(() => this.refreshSettings());
+        // The tracking switches and trusted proxies: saved by the server, read by the worker too.
+        this.settingsTimer = setInterval(() => { void this.refreshSettings(); }, 60_000);
+        this.settingsTimer.unref?.();
         if (this.processContext.isWorker) this.digest.start();
 
         const opts = getOptions();
@@ -304,6 +354,8 @@ export class EmailTrackingService implements OnApplicationBootstrap, OnModuleDes
 
     onModuleDestroy(): void {
         this.digest.stop();
+        if (this.settingsTimer) clearInterval(this.settingsTimer);
+        this.settingsTimer = null;
         if (this.retentionFirst) clearTimeout(this.retentionFirst);
         if (this.retentionTimer) clearInterval(this.retentionTimer);
         this.retentionFirst = null;
@@ -445,17 +497,176 @@ export class EmailTrackingService implements OnApplicationBootstrap, OnModuleDes
         return licenceLifecycleNotice(describeLicence(getLicenceStatus()), getEvalState(), PLUGIN_SHORT_ID);
     }
 
-    /** Dashboard widget payload: three 7-day figures, the notice, the route. */
+    /** Dashboard widget payload: four 7-day figures (tracked, opens, clicks, failed or bounced), the notice, the route. */
     async widgetData() {
-        const stats = await this.statsForDays(7);
+        const to = new Date();
+        const from = new Date(to.getTime() - 7 * DAY_MS);
+        const [stats, problems] = await Promise.all([this.statsForDays(7), this.failedOrBounced(from, to)]);
         const fmt = (key: string, label: string, format: DigestStat['format'] = 'count') =>
             ({ label, value: formatStat({ key, label, value: stats[key] ?? 0, format }) });
         return {
             tier: effectiveTier(),
             notice: this.licenceNotice(),
-            stats: [fmt('emailsTracked', 'Emails tracked'), fmt('emailOpens', 'Opens'), fmt('emailClicks', 'Clicks')],
+            stats: [
+                fmt('emailsTracked', 'Emails tracked'), fmt('emailOpens', 'Opens'), fmt('emailClicks', 'Clicks'),
+                { label: 'Failed or bounced', value: formatStat({ key: 'failedOrBounced', label: 'Failed or bounced', value: problems, format: 'count' }) },
+            ],
+            failedOrBounced: problems,
             route: `/extensions/${ADMIN_ROUTE}`,
         };
+    }
+
+    // ── Tracking settings (0.17.0) ─────────────────────────────────────
+
+    /** Read the stored switches and trusted proxies into this process (fail-soft). */
+    async refreshSettings(): Promise<void> {
+        try {
+            applyStoredPrefs(await this.prefs.all());
+        } catch (e: any) {
+            Logger.verbose(`tracking settings not read: ${e?.message}`, loggerCtx);
+        }
+    }
+
+    /** Validate and store a settings patch; applied in this process at once, in the others within a minute. */
+    async updateSettings(body: any): Promise<{ error: string; status?: number } | { ok: true }> {
+        const patch = settingsPatch(body);
+        if ('error' in patch) return patch;
+        for (const [k, v] of Object.entries(patch.prefs)) await this.prefs.set(k, v);
+        // PluginPrefs never throws: read each value back so a failed write is reported, not shown as saved.
+        for (const [k, v] of Object.entries(patch.prefs)) {
+            if ((await this.prefs.get(k)) !== v) return { error: 'The settings could not be saved (hulo_plugin_prefs is not writable); see the server log.', status: 500 };
+        }
+        await this.refreshSettings();
+        return { ok: true };
+    }
+
+    /** Emails that failed for good or bounced / complained in `[from, to)` (the widget's figure). */
+    async failedOrBounced(from: Date, to: Date): Promise<number> {
+        try {
+            const db = adapterFor(this.connection.rawConnection);
+            const { now, timelineFrom } = await this.clock();
+            const bounced = await db.query(
+                `SELECT COUNT(*) AS n FROM email_log WHERE status IN ('bounced', 'complained') AND \`createdAt\` >= ? AND \`createdAt\` < ?`,
+                [this.sqlDate(from), this.sqlDate(to)],
+            );
+            const refused: any[] = (await db.query(
+                `SELECT ${ATTEMPT_COLUMNS} FROM email_log
+                 WHERE status IN ('failed', 'deferred') AND \`createdAt\` >= ? AND \`createdAt\` < ?
+                 ORDER BY id DESC LIMIT ?`,
+                [this.sqlDate(from), this.sqlDate(to), TEMPLATE_REFUSED_CAP],
+            )) || [];
+            const infos = await attemptInfosFor((sql, params) => db.query(sql, params), refused, { now, timelineFrom, dbType: this.dbType() });
+            const failed = refused.filter(r => infos.get(Number(r.id))?.state === 'failed').length;
+            return (Number(bounced?.[0]?.n) || 0) + failed;
+        } catch (e: any) {
+            Logger.warn(`failed / bounced count failed: ${e?.message}`, loggerCtx);
+            return 0;
+        }
+    }
+
+    // ── Privacy: export / erase by address (0.17.0) ─────────────────────
+
+    /**
+     * The email_log ids of every email to `address` (alone or among several
+     * recipients), newest first, at most `limit`. A LIKE pre-filter, then the
+     * exact address match on each row's recipient list.
+     */
+    private async logIdsFor(address: string, limit: number): Promise<{ ids: number[]; rows: any[]; more: boolean }> {
+        const db = adapterFor(this.connection.rawConnection);
+        const like = `%${address.replace(/[\\%_]/g, m => '\\' + m)}%`;
+        const rows: any[] = (await db.query(
+            `SELECT id, \`createdAt\`, type, recipient, subject, status, \`orderId\`, \`orderCode\`, \`customerId\`, \`channelId\`, \`openCount\`, \`clickCount\`, \`machineCount\`, \`firstOpenedAt\`, \`firstClickedAt\`, \`errorMessage\`
+             FROM email_log WHERE LOWER(recipient) LIKE ? ORDER BY id DESC LIMIT ?`,
+            [like, Math.max(limit, PRIVACY_SCAN)],
+        )) || [];
+        const mine = rows.filter(r => splitRecipients(r.recipient).includes(address));
+        return { ids: mine.slice(0, limit).map(r => Number(r.id)), rows: mine.slice(0, limit), more: mine.length > limit || rows.length >= Math.max(limit, PRIVACY_SCAN) };
+    }
+
+    /**
+     * Everything the plugin holds about one address: its emails (type,
+     * subject, status, opens, clicks, the order), their events (time, kind,
+     * approximate location, client, classification — the IP is never in the
+     * events in clear when `hashIpsInHistory` is on), the events recorded
+     * against the address alone (admin suppressions), and its suppression
+     * entry.
+     */
+    async privacyExport(rawAddress: string): Promise<PrivacyExport | null> {
+        const address = normaliseAddress(rawAddress);
+        if (!address) return null;
+        const db = adapterFor(this.connection.rawConnection);
+        const { ids, rows, more } = await this.logIdsFor(address, PRIVACY_EXPORT_ROWS);
+        const events: any[] = [];
+        for (let i = 0; i < ids.length; i += PRIVACY_ERASE_CHUNK) {
+            const chunk = ids.slice(i, i + PRIVACY_ERASE_CHUNK);
+            const marks = chunk.map(() => '?').join(', ');
+            const r = await db.query(
+                `SELECT \`emailLogId\`, type, source, \`occurredAt\`, country, region, city, client, platform, classification, url, detail
+                 FROM email_event WHERE \`emailLogId\` IN (${marks}) ORDER BY id ASC`,
+                chunk,
+            ).catch(() => []);
+            events.push(...(r || []));
+        }
+        const own = await db.query(
+            'SELECT `emailLogId`, type, source, `occurredAt`, detail FROM email_event WHERE `recipientHash` = ? AND `emailLogId` IS NULL ORDER BY id ASC',
+            [recipientHash(address, eventHashKey())],
+        ).catch(() => []);
+        events.push(...(own || []));
+        const sup = await this.connection.rawConnection.getRepository(EmailSuppression).findOne({ where: { recipient: address } });
+        const iso = (v: any) => (v instanceof Date ? v.toISOString() : v ?? null);
+        return {
+            email: address,
+            generatedAt: new Date().toISOString(),
+            emails: rows.map(r => ({
+                id: Number(r.id), sentAt: iso(r.createdAt), type: r.type, recipient: r.recipient, subject: r.subject, status: r.status,
+                orderId: r.orderId ?? null, orderCode: r.orderCode ?? null, customerId: r.customerId ?? null, channelId: r.channelId ?? null,
+                opens: Number(r.openCount) || 0, clicks: Number(r.clickCount) || 0, machineHits: Number(r.machineCount) || 0,
+                firstOpenedAt: iso(r.firstOpenedAt), firstClickedAt: iso(r.firstClickedAt), note: r.errorMessage ?? null,
+            })),
+            events: events.map(e => ({ ...e, occurredAt: iso(e.occurredAt) })),
+            suppression: sup ? { recipient: sup.recipient, reason: sup.reason, note: sup.note ?? null, addedAt: iso(sup.createdAt) } : null,
+            truncated: more,
+        };
+    }
+
+    /**
+     * Erase the emails sent to an address: their email_log rows (with the
+     * open and click history), their email_event timeline and email_link
+     * rows, and the events recorded against the address alone. The
+     * suppression entry is kept (reported as retained): it is the record
+     * that the address must not be emailed; remove it from the suppression
+     * list separately if it should go too. An email to several recipients is
+     * erased as a whole. Returns the counts.
+     */
+    async privacyErase(rawAddress: string): Promise<{ email: string; emails: number; events: number; links: number; suppressionRetained: boolean } | null> {
+        const address = normaliseAddress(rawAddress);
+        if (!address) return null;
+        const db = adapterFor(this.connection.rawConnection);
+        const out = { email: address, emails: 0, events: 0, links: 0, suppressionRetained: false };
+        for (let round = 0; round < 1000; round++) {
+            const { ids } = await this.logIdsFor(address, PRIVACY_SCAN);
+            if (!ids.length) break;
+            for (let i = 0; i < ids.length; i += PRIVACY_ERASE_CHUNK) {
+                const chunk = ids.slice(i, i + PRIVACY_ERASE_CHUNK);
+                const marks = chunk.map(() => '?').join(', ');
+                const ev = await db.query(`SELECT COUNT(*) AS n FROM email_event WHERE \`emailLogId\` IN (${marks})`, chunk).catch(() => [{ n: 0 }]);
+                await db.query(`DELETE FROM email_event WHERE \`emailLogId\` IN (${marks})`, chunk, { needAffected: true }).catch(() => undefined);
+                const ln = await db.query(`SELECT COUNT(*) AS n FROM email_link WHERE \`emailLogId\` IN (${marks})`, chunk).catch(() => [{ n: 0 }]);
+                await db.query(`DELETE FROM email_link WHERE \`emailLogId\` IN (${marks})`, chunk, { needAffected: true }).catch(() => undefined);
+                await db.query(`DELETE FROM email_log WHERE id IN (${marks})`, chunk, { needAffected: true });
+                out.events += Number(ev?.[0]?.n) || 0;
+                out.links += Number(ln?.[0]?.n) || 0;
+                out.emails += chunk.length;
+            }
+            if (ids.length < PRIVACY_SCAN) break;
+        }
+        const hash = recipientHash(address, eventHashKey());
+        const own = await db.query('SELECT COUNT(*) AS n FROM email_event WHERE `recipientHash` = ? AND `emailLogId` IS NULL', [hash]).catch(() => [{ n: 0 }]);
+        await db.query('DELETE FROM email_event WHERE `recipientHash` = ? AND `emailLogId` IS NULL', [hash], { needAffected: true }).catch(() => undefined);
+        out.events += Number(own?.[0]?.n) || 0;
+        out.suppressionRetained = !!(await this.connection.rawConnection.getRepository(EmailSuppression).findOne({ where: { recipient: address } }));
+        Logger.info(`privacy erase: ${out.emails} email(s), ${out.events} event(s), ${out.links} link(s) removed for one address`, loggerCtx);
+        return out;
     }
 
     private async digestCollect(from: Date, to: Date): Promise<Omit<DigestInput, 'periodStart' | 'periodEnd' | 'pluginName' | 'shortId'>> {
@@ -570,10 +781,22 @@ export class EmailTrackingService implements OnApplicationBootstrap, OnModuleDes
         const repo = this.connection.rawConnection.getRepository(EmailLog);
         const recipient = this.firstAddress(mail.to) || '';
 
-        // Suppression check — refuse to call SMTP for recipients on the
-        // suppression list, and record a `status='suppressed'` row so
-        // the admin can still see the attempt in the log.
-        if (recipient && await this.isSuppressed(recipient)) {
+        // Suppression (free since 0.17.0): addresses on the list are dropped from `to`;
+        // with nobody left nothing is sent and a `status='suppressed'` row records the
+        // attempt. `meta.type` in `suppressionExemptTypes` (default: password-reset) is
+        // always sent.
+        const exempt = isSuppressionExempt(meta.type, getOptions().suppressionExemptTypes ?? DEFAULT_SUPPRESSION_EXEMPT_TYPES);
+        const toList = splitRecipients(mail.to);
+        let dropped: string[] = [];
+        if (!exempt && toList.length) {
+            try {
+                const db = adapterFor(this.connection.rawConnection);
+                dropped = await findSuppressed((sql, params) => db.query(sql, params), toList);
+            } catch (e: any) {
+                Logger.warn(`suppression list not read (sending to every recipient): ${e?.message}`, loggerCtx);
+            }
+        }
+        if (dropped.length && dropped.length >= toList.length) {
             const suppressed = repo.create({
                 type: meta.type, recipient,
                 subject: String(mail.subject || ''),
@@ -581,16 +804,17 @@ export class EmailTrackingService implements OnApplicationBootstrap, OnModuleDes
                 channelId: meta.channelId || 1,
                 customerId: meta.customerId, orderId: meta.orderId, orderCode: meta.orderCode,
                 invoiceId: meta.invoiceId, applicationId: meta.applicationId,
-                status: 'suppressed' as EmailLogStatus, tracked: true,
-                errorMessage: 'Recipient is on the suppression list',
+                status: 'suppressed' as EmailLogStatus, tracked: false,
+                errorMessage: SUPPRESSED_NOTE,
             });
             const row = await repo.save(suppressed);
             await this.events.record({
                 type: 'suppressed', source: 'smtp', log: this.linkOf(row), recipient,
-                detail: 'Not sent: the recipient is on the suppression list',
+                detail: SUPPRESSED_NOTE,
             });
             return row;
         }
+        if (dropped.length) mail = { ...mail, to: toList.filter(a => !dropped.includes(a)) };
 
         // Create the row up-front so the pixel/click URLs have an id to
         // reference. status starts as 'sent' optimistically; we update
@@ -610,7 +834,8 @@ export class EmailTrackingService implements OnApplicationBootstrap, OnModuleDes
             invoiceId: meta.invoiceId,
             applicationId: meta.applicationId,
             status: 'sent' as EmailLogStatus,
-            tracked: true,
+            tracked: trackingSwitches().opens || trackingSwitches().clicks,
+            ...(dropped.length ? { errorMessage: partialSuppressionNote(dropped) } : {}),
         });
         const saved = await repo.save(row);
 
@@ -621,8 +846,9 @@ export class EmailTrackingService implements OnApplicationBootstrap, OnModuleDes
         if (mail.html && !html) Logger.warn('tracked send: non-string html body left untouched (no tracking)', loggerCtx);
         let links: LinkMeta[] = [];
         let signed: boolean | null = null;
-        if (html) {
-            const wrapped = wrapTrackedHtml(html, Number(saved.id));
+        const switches = trackingSwitches();
+        if (html && (switches.opens || switches.clicks)) {
+            const wrapped = wrapTrackedHtml(html, Number(saved.id), switches);
             links = wrapped.links;
             signed = wrapped.signed;
             mail = { ...mail, html: wrapped.html };
@@ -758,13 +984,19 @@ export class EmailTrackingService implements OnApplicationBootstrap, OnModuleDes
             return;
         }
         const ipForRow = opts.hashIpsInHistory ? hashIp(ip, opts.ipSalt || '') : ip;
+        // Machine traffic (scanners, Apple MPP, bots) is recorded but not counted as an open (engagement-class.ts).
+        const counted = engagementCounts('open', classifyEngagement('open', ua, ip));
         // Atomic counter: Gmail's proxy, Apple MPP and the real open arrive together.
-        const r = await adapterFor(this.connection.rawConnection).query(
-            `UPDATE email_log SET \`openCount\` = \`openCount\` + 1, \`lastOpenedAt\` = ?,
-                    \`firstOpenedAt\` = COALESCE(\`firstOpenedAt\`, ?), \`firstOpenIp\` = COALESCE(\`firstOpenIp\`, ?), \`firstOpenUserAgent\` = COALESCE(\`firstOpenUserAgent\`, ?)
-              WHERE id = ?`,
-            [this.sqlDate(now), this.sqlDate(now), ipForRow || null, ua ? ua.slice(0, 1000) : null, id], { needAffected: true },
-        );
+        const r = counted
+            ? await adapterFor(this.connection.rawConnection).query(
+                `UPDATE email_log SET \`openCount\` = \`openCount\` + 1, \`lastOpenedAt\` = ?,
+                        \`firstOpenedAt\` = COALESCE(\`firstOpenedAt\`, ?), \`firstOpenIp\` = COALESCE(\`firstOpenIp\`, ?), \`firstOpenUserAgent\` = COALESCE(\`firstOpenUserAgent\`, ?)
+                  WHERE id = ?`,
+                [this.sqlDate(now), this.sqlDate(now), ipForRow || null, ua ? ua.slice(0, 1000) : null, id], { needAffected: true },
+            )
+            : await adapterFor(this.connection.rawConnection).query(
+                'UPDATE email_log SET `machineCount` = `machineCount` + 1 WHERE id = ?', [id], { needAffected: true },
+            );
         // MySQL / Postgres report the affected rows; sqlite does not (the lookup below decides).
         const affected = r?.affectedRows ?? r?.rowCount;
         if (affected !== undefined && !Number(affected)) return;
@@ -783,7 +1015,8 @@ export class EmailTrackingService implements OnApplicationBootstrap, OnModuleDes
             ua: ua ? ua.slice(0, 300) : null,
             client: parsed.client,
             platform: parsed.platform,
-            isBot: parsed.isBot,
+            isBot: parsed.isBot || !counted,
+            counted,
             country: geo.country,
             region: geo.region,
             city: geo.city,
@@ -811,10 +1044,16 @@ export class EmailTrackingService implements OnApplicationBootstrap, OnModuleDes
         if (eventOnly) {
             row = await repo.findOne({ where: { id }, select: ['id', 'orderId', 'customerId', 'channelId'] as any });
         } else {
-            const r = await adapterFor(this.connection.rawConnection).query(
-                `UPDATE email_log SET \`clickCount\` = \`clickCount\` + 1, \`firstClickedAt\` = COALESCE(\`firstClickedAt\`, ?) WHERE id = ?`,
-                [this.sqlDate(now), id], { needAffected: true },
-            );
+            // A security scanner or link checker following the link is recorded, not counted as a click.
+            const counted = engagementCounts('click', classifyEngagement('click', ua, ip));
+            const r = counted
+                ? await adapterFor(this.connection.rawConnection).query(
+                    `UPDATE email_log SET \`clickCount\` = \`clickCount\` + 1, \`firstClickedAt\` = COALESCE(\`firstClickedAt\`, ?) WHERE id = ?`,
+                    [this.sqlDate(now), id], { needAffected: true },
+                )
+                : await adapterFor(this.connection.rawConnection).query(
+                    'UPDATE email_log SET `machineCount` = `machineCount` + 1 WHERE id = ?', [id], { needAffected: true },
+                );
             const affected = r?.affectedRows ?? r?.rowCount;
             if (affected !== undefined && !Number(affected)) return null;
             row = await repo.findOne({ where: { id } });
@@ -880,51 +1119,80 @@ export class EmailTrackingService implements OnApplicationBootstrap, OnModuleDes
         return !!getOptions().signingSecret;
     }
 
-    /** SMTP DSN (bounce / complaint) hook — wire up if you point Postmaster
-     *  Tools / a bounce-processor at /email-track/bounce. Hard bounces +
-     *  complaints automatically add the recipient to the suppression list
-     *  so the next send-attempt is refused. */
-    async recordBounce(messageId: string, status: 'bounced' | 'complained', reason?: string, opts: { soft?: boolean } = {}) {
+    /**
+     * A bounce webhook report (`POST /email-track/bounce`, 0.17.0 strict):
+     * marks the email with this Message-ID bounced, complained or (soft
+     * bounce) deferred, and puts addresses on the suppression list for a
+     * hard bounce or a complaint — the address the report names (it must be
+     * one of the email's recipients), else the email's only recipient. An
+     * email to several people with no address named suppresses nobody, so one
+     * dead mailbox never stops mail to the others; a soft bounce never
+     * suppresses. `matched` is false for an unknown Message-ID or a named
+     * address that is not one of the email's recipients (nothing changes).
+     */
+    async recordBounceReport(messageId: string, status: 'bounced' | 'complained', reason?: string,
+        opts: { soft?: boolean; recipient?: string | null } = {}): Promise<{ matched: boolean; suppressed: number }> {
         const repo = this.connection.rawConnection.getRepository(EmailLog);
         // Providers send the Message-ID with or without angle brackets.
         const bare = messageId.replace(/^<|>$/g, '');
         const row = (await repo.findOne({ where: { smtpMessageId: bare } })) || (await repo.findOne({ where: { smtpMessageId: `<${bare}>` } }));
-        if (!row) return false;
+        if (!row) return { matched: false, suppressed: 0 };
+        const soft = status === 'bounced' && !!opts.soft;
+        const { matched, targets } = suppressionTargets(row.recipient, opts.recipient || null);
+        if (!matched) return { matched: false, suppressed: 0 };
+        const named = opts.recipient ? normaliseAddress(opts.recipient) : null;
+        const several = splitRecipients(row.recipient).length > 1;
+        let note = reason || '';
+        if (several && named) note = `${named}${reason ? `: ${reason}` : ''}`;
+        else if (several && !soft) note = `${reason ? `${reason} ` : ''}(The report did not say which recipient, so no address was added to the suppression list.)`;
         // Status precedence (event-types.ts): a soft bounce never overwrites a
         // delivered/bounced/complained email, a bounce never a complaint.
-        await this.events.applyStatus(Number(row.id), opts.soft ? 'deferred' : status, reason || null);
-        const type = opts.soft ? 'soft-bounce' : status === 'complained' ? 'complained' : 'bounced';
+        await this.events.applyStatus(Number(row.id), soft ? 'deferred' : status, note || null);
+        const type = soft ? 'soft-bounce' : status === 'complained' ? 'complained' : 'bounced';
         await this.events.record({
-            type, source: 'bounce-webhook', log: this.linkOf(row), recipient: row.recipient, messageId: bare,
+            type, source: 'bounce-webhook', log: this.linkOf(row), recipient: named || row.recipient, messageId: bare,
             // A retried webhook carries the same facts: one row.
-            dedupeKey: dedupeKeyFor('bounce-webhook', `${bare}|${type}|${reason || ''}`),
+            dedupeKey: dedupeKeyFor('bounce-webhook', `${bare}|${type}|${named || ''}|${reason || ''}`),
             detail: reason || null,
         });
-        if (opts.soft) return true; // mailbox full / greylisted: never suppress
-
-        if (row.recipient) {
-            const suppressionReason = status === 'complained' ? 'complaint' : 'hard-bounce';
-            await this.addSuppression(row.recipient, suppressionReason, reason || `Auto-added from ${status} on email #${row.id}`, row.channelId);
+        if (soft) return { matched: true, suppressed: 0 }; // mailbox full / greylisted: never suppress
+        const suppressionReason = status === 'complained' ? 'complaint' : 'hard-bounce';
+        let n = 0;
+        for (const a of targets) {
+            await this.addSuppression(a, suppressionReason, reason || `Auto-added from ${status === 'complained' ? 'the spam complaint about' : 'the hard bounce of'} email #${row.id}`, row.channelId);
+            n++;
         }
-        return true;
+        return { matched: true, suppressed: n };
     }
 
-    /** Returns true if the recipient should be skipped at send-time. */
+    /** 0.16-compatible wrapper of `recordBounceReport`: true when the Message-ID matched. */
+    async recordBounce(messageId: string, status: 'bounced' | 'complained', reason?: string, opts: { soft?: boolean; recipient?: string | null } = {}): Promise<boolean> {
+        return (await this.recordBounceReport(messageId, status, reason, opts)).matched;
+    }
+
+    /**
+     * True if the address is on the suppression list (free since 0.17.0:
+     * enforced at send in every tier). Accepts a bare address or a
+     * `Name <address>` form; a comma-joined list is suppressed only when
+     * every address on it is (use `suppressedAmong` for the per-address answer).
+     */
     async isSuppressed(recipient: string): Promise<boolean> {
-        // Suppression-list enforcement is a paid feature. Unlicensed
-        // installs always return false here so the suppression rows
-        // are visible in the admin UI but not consulted on send —
-        // matches the privacy boundary "we don't gate your own emails".
-        if (!hasPremiumAccess()) return false;
-        if (!recipient) return false;
-        const repo = this.connection.rawConnection.getRepository(EmailSuppression);
-        const row = await repo.findOne({ where: { recipient: recipient.toLowerCase() } });
-        return !!row;
+        const list = splitRecipients(recipient);
+        if (!list.length) return false;
+        const hit = await this.suppressedAmong(list);
+        return hit.length === list.length;
+    }
+
+    /** Which of these addresses are on the suppression list. */
+    async suppressedAmong(addresses: string[]): Promise<string[]> {
+        const db = adapterFor(this.connection.rawConnection);
+        return findSuppressed((sql, params) => db.query(sql, params), addresses);
     }
 
     async addSuppression(recipient: string, reason: string, note?: string, channelId?: number): Promise<EmailSuppression> {
         const repo = this.connection.rawConnection.getRepository(EmailSuppression);
-        const lower = recipient.toLowerCase();
+        // One bare address (a provider may report `Name <a@b>`); anything else is stored as given, lower-cased.
+        const lower = normaliseAddress(recipient) || recipient.trim().toLowerCase().slice(0, 320);
         const existing = await repo.findOne({ where: { recipient: lower } });
         if (existing) {
             if (note && note !== existing.note) {
@@ -953,7 +1221,7 @@ export class EmailTrackingService implements OnApplicationBootstrap, OnModuleDes
 
     async removeSuppression(recipient: string): Promise<boolean> {
         const repo = this.connection.rawConnection.getRepository(EmailSuppression);
-        const res = await repo.delete({ recipient: recipient.toLowerCase() });
+        const res = await repo.delete({ recipient: normaliseAddress(recipient) || recipient.trim().toLowerCase() });
         return !!(res.affected && res.affected > 0);
     }
 

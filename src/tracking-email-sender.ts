@@ -8,6 +8,11 @@ import { EmailEventService } from './email-event.service';
 import { correlationHeaders, ExtraHeaderValue, mergeHeaders, providerMessageIdFromSmtpReply, sendPayload, wrapTrackedHtml } from './outgoing-mail';
 import { LinkMeta } from './link-meta';
 import { replyCode } from './send-attempts';
+import { currentEmailContext, installEmailProcessorHook } from './email-context';
+import { DEFAULT_SUPPRESSION_EXEMPT_TYPES, isSuppressionExempt, splitRecipients } from './recipients';
+import { partialSuppressionNote, SUPPRESSED_NOTE, suppressionDecision } from './suppression-store';
+import { getOptions } from './options';
+import { trackingSwitches } from './tracking-settings';
 
 const loggerCtx = 'TrackingEmailSender';
 
@@ -84,6 +89,11 @@ export class TrackingEmailSender implements EmailSender {
     private connection!: TransactionalConnection;
     private events: EmailEventService | null = null;
 
+    constructor() {
+        // The EmailPlugin's job runs inside the sender's context (its event type and order).
+        installEmailProcessorHook();
+    }
+
     init(injector: Injector) {
         try {
             this.connection = injector.get(TransactionalConnection);
@@ -137,14 +147,23 @@ export class TrackingEmailSender implements EmailSender {
         }
 
         const repo = this.connection.rawConnection.getRepository(EmailLog);
-        // Vendure's `EmailDetails` doesn't carry the source Order / Customer
-        // through to the sender — we get subject/body only. Recover the
-        // orderCode from the subject (Vendure's default templates render it
-        // as `#<code>`) and then look up the Order by code for the id +
-        // customerId. Best-effort: if none of that resolves, the row still
-        // saves with just the raw envelope, exactly as before.
-        const orderCode = this.extractOrderCode(email.subject, email.body);
-        const linkedIds = orderCode ? await this.lookupOrderIds(orderCode) : null;
+        // The sender's own context (email-context.ts): the EmailPlugin event
+        // type and the order in its template variables. Without one (an
+        // EmailSender called outside the EmailPlugin's job), the order code is
+        // recovered from the subject (Vendure's default templates render it as
+        // `#<code>`) and the order looked up by code. Best-effort: if none of
+        // that resolves, the row still saves with just the raw envelope.
+        const context = currentEmailContext();
+        let orderCode = context?.orderCode || null;
+        let linkedIds: { orderId: number; customerId: number | null; channelId: number | null; code?: string } | null = null;
+        if (context?.orderId) {
+            linkedIds = await this.lookupOrderById(context.orderId);
+            if (linkedIds && !linkedIds.customerId && context.customerId) linkedIds.customerId = context.customerId;
+            if (linkedIds?.code) orderCode = linkedIds.code;
+        } else {
+            orderCode = orderCode || this.extractOrderCode(email.subject, email.body);
+            linkedIds = orderCode ? await this.lookupOrderIds(orderCode) : null;
+        }
         // Even without an order (password-reset, OTP, email-verification,
         // welcome, etc.) we can still link the row to a customer by
         // recipient email. Doing it here means the per-customer Emails
@@ -152,8 +171,20 @@ export class TrackingEmailSender implements EmailSender {
         const customerIdByEmail = !linkedIds?.customerId
             ? await this.lookupCustomerIdByEmail(email.recipient)
             : null;
+        // Suppression (free since 0.17.0): addresses on the list are dropped; with nobody left
+        // the email is not sent. Only a type the sender gave can exempt it (a password reset).
+        const exempt = isSuppressionExempt(context?.type, getOptions().suppressionExemptTypes ?? DEFAULT_SUPPRESSION_EXEMPT_TYPES);
+        const recipients = splitRecipients(email.recipient);
+        let decision: { kept: string[]; dropped: string[] } = { kept: recipients, dropped: [] };
+        try {
+            const db = adapterFor(this.connection.rawConnection);
+            decision = await suppressionDecision((sql, params) => db.query(sql, params), recipients, exempt);
+        } catch (e: any) {
+            Logger.warn(`suppression list not read (sending to every recipient): ${e?.message}`, loggerCtx);
+        }
+        const type = context?.type || this.inferType(email.subject);
         const payload: Partial<EmailLog> = {
-            type: this.inferType(email.subject),
+            type,
             recipient: (email.recipient || '').slice(0, 255),
             subject: (email.subject || '').slice(0, 512),
             fromAddress: (email.from || '').slice(0, 255),
@@ -167,6 +198,33 @@ export class TrackingEmailSender implements EmailSender {
         if (linkedIds?.orderId) payload.orderId = linkedIds.orderId;
         if (linkedIds?.customerId != null) payload.customerId = linkedIds.customerId;
         else if (customerIdByEmail != null) payload.customerId = customerIdByEmail;
+        if (!linkedIds?.channelId && context?.channelId) payload.channelId = context.channelId;
+
+        if (decision.dropped.length && !decision.kept.length) {
+            // Every recipient is suppressed: a `suppressed` row, no SMTP call, no error (the job must not retry).
+            try {
+                const row = await repo.save(repo.create({ ...payload, status: 'suppressed' as EmailLogStatus, tracked: false, errorMessage: SUPPRESSED_NOTE }));
+                if (this.events) {
+                    await this.events.record({
+                        type: 'suppressed', source: 'smtp', recipient: row.recipient,
+                        log: { id: Number(row.id), orderId: row.orderId ?? null, customerId: row.customerId ?? null, channelId: row.channelId ?? null },
+                        detail: SUPPRESSED_NOTE,
+                    });
+                }
+                Logger.info(`Suppressed plugin-email [${row.type}] to ${row.recipient} (id=${row.id}): not sent`, loggerCtx);
+            } catch (e: any) {
+                Logger.warn(`suppressed email not logged: ${e?.message}`, loggerCtx);
+            }
+            return;
+        }
+        if (decision.dropped.length) {
+            email.recipient = decision.kept.join(', ');
+            payload.recipient = email.recipient.slice(0, 255);
+            payload.errorMessage = partialSuppressionNote(decision.dropped);
+        }
+        const switches = trackingSwitches();
+        const wrap = switches.opens || switches.clicks;
+        payload.tracked = wrap;
         // The log row must never stop the email (OTP, password reset, order
         // confirmation): a DB error here means "send untracked", not "fail".
         // It is written before SMTP starts, as `sent` with no reply: until the
@@ -182,15 +240,17 @@ export class TrackingEmailSender implements EmailSender {
         // Rewrite + pixel-inject the html body in place; note each link for the click events.
         let links: LinkMeta[] = [];
         let signed: boolean | null = null;
-        if (saved) {
+        if (saved && wrap) {
             try {
-                const wrapped = wrapTrackedHtml(email.body || '', Number(saved.id));
+                const wrapped = wrapTrackedHtml(email.body || '', Number(saved.id), switches);
                 email.body = wrapped.html;
                 links = wrapped.links;
                 signed = wrapped.signed;
             } catch (e: any) {
                 Logger.warn(`tracking wrap failed: ${e?.message}`, loggerCtx);
             }
+        }
+        if (saved) {
             // Configured providers echo the email_log id back in their webhook events.
             try { this.inner.setExtraHeaders(email, correlationHeaders(Number(saved.id))); } catch { /* never blocks the send */ }
         }
@@ -286,6 +346,30 @@ export class TrackingEmailSender implements EmailSender {
         }
     }
 
+    /** The order's code, customer and channel by id (the sender's context names the order). */
+    private async lookupOrderById(id: number): Promise<{ orderId: number; customerId: number | null; channelId: number | null; code?: string } | null> {
+        try {
+            const rows: any[] = await adapterFor(this.connection.rawConnection).query(
+                `SELECT o.id, o.code, o.\`customerId\`,
+                        (SELECT occ.\`channelId\` FROM order_channels_channel occ JOIN channel ch ON ch.id = occ.\`channelId\`
+                          WHERE occ.\`orderId\` = o.id ORDER BY (ch.code = '__default_channel__') ASC, occ.\`channelId\` DESC LIMIT 1) AS channelId
+                   FROM \`order\` o WHERE o.id = ? LIMIT 1`,
+                [id],
+            );
+            if (!rows?.length) return null;
+            const r = rows[0];
+            return {
+                orderId: Number(r.id),
+                code: r.code ? String(r.code) : undefined,
+                customerId: r.customerId != null ? Number(r.customerId) : null,
+                channelId: r.channelId != null ? Number(r.channelId) : null,
+            };
+        } catch (e: any) {
+            Logger.warn(`order lookup failed for id=${id}: ${e?.message}`, loggerCtx);
+            return null;
+        }
+    }
+
     /**
      * Find a Customer id by their email address so emails without any
      * order context (password reset, OTP, verification, welcome, etc.)
@@ -307,7 +391,7 @@ export class TrackingEmailSender implements EmailSender {
         }
     }
 
-    /** Best-effort categorisation of plugin-email sends. */
+    /** Fallback label for an email sent without the sender's context (never used for a suppression exemption). */
     private inferType(subject: string): string {
         const s = (subject || '').toLowerCase();
         if (s.includes('order confirmation') || s.includes('order receipt')) return 'order-confirmation';

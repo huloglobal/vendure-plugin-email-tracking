@@ -71,10 +71,11 @@ export interface EmailTrackingPluginOptions {
     publicBaseUrl: string;
 
     /** Licence JWT. Without a valid key every feature is on for a 14-day
-     *  evaluation (no card); after it, the free tier: emails, send outcomes,
-     *  bounces, complaints and provider drops are still logged, while opens
-     *  and clicks are not recorded (the pixel and redirect endpoints still
-     *  answer) and the premium features are off. */
+     *  evaluation (no card); after it, the free tier: the email log, open and
+     *  click recording, the suppression list (enforced at send), the per-order
+     *  and per-customer email lists, bounces, complaints and provider drops,
+     *  privacy export / erase and the settings stay on; the premium features
+     *  (`PREMIUM_FEATURES`) stop, and their data is kept. */
     licenceKey?: string;
 
     /** Hosts the click rewriter recognises as already-tracked. Defaults
@@ -117,6 +118,31 @@ export interface EmailTrackingPluginOptions {
      *  `x-forwarded-for` yields the right-most public hop (the one your
      *  proxy appended), never the client-supplied left-most entry. */
     trustedIpHeaders?: Array<'cf-connecting-ip' | 'true-client-ip' | 'x-real-ip' | 'x-forwarded-for'>;
+    /**
+     * Your reverse proxies (0.17.0): IP addresses or CIDR ranges, IPv4 or
+     * IPv6, e.g. `['10.0.0.0/8', '2400:cb00::/32']`. When set, the
+     * `trustedIpHeaders` are believed only for a connection that comes from
+     * one of them (anyone else is their own socket address), and in
+     * `X-Forwarded-For` the visitor is the right-most hop that is not one of
+     * them. Unset: the 0.16 behaviour (headers believed from any peer; the
+     * right-most public X-Forwarded-For hop). More ranges can be added in
+     * Admin → Email Log → Settings.
+     */
+    trustedProxies?: string[];
+
+    // ── Tracking switches (0.17.0) ──────────────────────────────────────
+    /** Add the open pixel and record opens. Default true. Admin → Email Log → Settings overrides it. */
+    trackOpens?: boolean;
+    /** Rewrite links through the click redirector and record clicks. Default true. Admin → Email Log → Settings overrides it. */
+    trackClicks?: boolean;
+    /**
+     * E-mail types sent even to an address on the suppression list. Only a
+     * type the sender gave counts (the Vendure EmailPlugin event type, or
+     * `sendTracked`'s `meta.type`), never one guessed from the subject.
+     * Default `['password-reset']`, so a customer can always get back into
+     * their account.
+     */
+    suppressionExemptTypes?: string[];
 
     /**
      * Domain allowlist for the click redirector. When non-empty, click
@@ -191,7 +217,7 @@ export interface EmailTrackingPluginOptions {
 /** The public salt used when `ipSalt` is not set (kept for the 0.15-compatible `email_log` hashes). */
 export const DEFAULT_IP_SALT = 'hulo-email-tracking-default-salt';
 
-const DEFAULTS: Required<Omit<EmailTrackingPluginOptions, 'licenceKey' | 'trackedHosts' | 'signingSecret' | 'bounceWebhookSecret' | 'clickRedirectAllowedDomains' | 'providerWebhooks' | 'ipEnrichment'>> = {
+const DEFAULTS: Required<Omit<EmailTrackingPluginOptions, 'licenceKey' | 'trackedHosts' | 'signingSecret' | 'bounceWebhookSecret' | 'clickRedirectAllowedDomains' | 'providerWebhooks' | 'ipEnrichment' | 'trustedProxies' | 'suppressionExemptTypes'>> = {
     publicBaseUrl: 'http://localhost:3000',
     rateLimit: { capacity: 60, windowMs: 60_000 },
     ipSalt: DEFAULT_IP_SALT,
@@ -199,6 +225,8 @@ const DEFAULTS: Required<Omit<EmailTrackingPluginOptions, 'licenceKey' | 'tracke
     retention: { days: 365 },
     allowUnauthenticatedBounceWebhook: false,
     trustedIpHeaders: [],
+    trackOpens: true,
+    trackClicks: true,
 };
 
 let cachedOptions: EmailTrackingPluginOptions = { ...DEFAULTS };

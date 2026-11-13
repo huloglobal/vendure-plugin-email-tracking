@@ -13,6 +13,7 @@ import { EmailSuppression } from '../src/email-suppression.entity';
 import { EmailTrackingPlugin } from '../src/plugin';
 import { EmailTrackingService } from '../src/email-tracking.service';
 import { getOptions, setLicenceStatus } from '../src/options';
+import { applyStoredPrefs, resetStoredPrefs } from '../src/tracking-settings';
 import { signValue } from '@huloglobal/vendure-licence-sdk';
 import gql from 'graphql-tag';
 
@@ -68,14 +69,12 @@ describe('@huloglobal/vendure-plugin-email-tracking', () => {
         expect(count).toBe(0);
     });
 
-    it('always serves the 1×1 GIF but does not record opens when unlicensed', async () => {
-        // Two contracts verified on this unlicensed instance:
-        //   1. The pixel is ALWAYS served (200, real GIF bytes) so emails
-        //      never show a broken image and we never leak whether the id
-        //      or signature was valid.
-        //   2. Open tracking is a paid feature — without a licence the open
-        //      must NOT be recorded (openCount stays 0). This is the gate
-        //      that makes the plugin commercially viable.
+    it('always serves the 1×1 GIF, and records opens in the free tier (0.17.0) — never a bare id, never a bot as an open', async () => {
+        // 1. The pixel is ALWAYS served (200, real GIF bytes) so emails never
+        //    show a broken image and we never leak whether the id was valid.
+        // 2. Open recording is free since 0.17.0: a signed open counts on this
+        //    unlicensed instance; a bare id while a secret exists is an event
+        //    only; a machine fetch is counted in machineCount, not openCount.
         const conn: TransactionalConnection = (server as any).app.get(TransactionalConnection);
         const repo = conn.rawConnection.getRepository(EmailLog);
         const row = await repo.save(repo.create({
@@ -95,15 +94,21 @@ describe('@huloglobal/vendure-plugin-email-tracking', () => {
         expect(res.headers.get('content-type')).toBe('image/gif');
         const body = Buffer.from(await res.arrayBuffer());
         expect(body.length).toBeGreaterThan(20);
-        // No-store so privacy prefetchers are re-counted per fetch once licensed.
         expect(res.headers.get('cache-control')).toContain('no-store');
-
-        // recordOpen() is fire-and-forget; give it a moment, then confirm the
-        // licence gate held — nothing was recorded.
         await new Promise(r => setTimeout(r, 150));
-        const reloaded = await repo.findOne({ where: { id: row.id } });
-        expect(reloaded?.openCount).toBe(0);
-        expect(JSON.parse(reloaded?.opensJson || '[]')).toHaveLength(0);
+        expect((await repo.findOne({ where: { id: row.id } }))?.openCount).toBe(0); // bare id: event only
+
+        const token = signValue(String(row.id), getOptions().signingSecret!);
+        await fetch(`http://localhost:${PORT}/email-track/open/${token}.gif`, { headers: { 'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36' } });
+        await fetch(`http://localhost:${PORT}/email-track/open/${token}.gif`, { headers: { 'user-agent': 'python-requests/2.31' } });
+        const deadline = Date.now() + 5000;
+        let reloaded = await repo.findOne({ where: { id: row.id } });
+        while (Date.now() < deadline && !((reloaded?.openCount ?? 0) >= 1 && (reloaded?.machineCount ?? 0) >= 1)) {
+            await new Promise(r => setTimeout(r, 50));
+            reloaded = await repo.findOne({ where: { id: row.id } });
+        }
+        expect(reloaded?.openCount).toBe(1);
+        expect(reloaded?.machineCount).toBe(1);
     });
 
     it('rejects click redirect to invalid url and accepts a valid one', async () => {
@@ -795,6 +800,187 @@ describe('@huloglobal/vendure-plugin-email-tracking', () => {
         const soft = await conn().rawConnection.getRepository(EmailEvent).find({ where: { emailLogId: Number(row.id), type: 'soft-bounce' } });
         expect(soft).toHaveLength(1); // the second, identical call was a retry of the same facts
         expect(await conn().rawConnection.getRepository(EmailSuppression).findOne({ where: { recipient: 'soft@example.com' } })).toBeNull();
+    });
+
+    // ── 0.17.0 parity wave ────────────────────────────────────────────────
+
+    describe('0.17.0: free suppression, strict bounces, settings, privacy, premium reports', () => {
+        const sendgridTransport = () => nodemailer.createTransport({ streamTransport: true, buffer: true });
+        const sig = (b: string) => createHmac('sha256', 'e2e-signing-secret').update(b).digest('hex');
+        const bounce = (payload: any) => {
+            const b = JSON.stringify(payload);
+            return fetch(`${BASE}/email-track/bounce`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-signature': sig(b) }, body: b });
+        };
+        const supRepo = () => conn().rawConnection.getRepository(EmailSuppression);
+        const logRepo = () => conn().rawConnection.getRepository(EmailLog);
+
+        beforeAll(async () => {
+            setLicenceStatus({ valid: false, message: 'e2e: free tier' } as any);
+            adminClient.setChannelToken(E2E_DEFAULT_CHANNEL_TOKEN);
+            await adminClient.asSuperAdmin();
+        });
+        afterAll(() => setLicenceStatus({ valid: false, message: 'e2e done' } as any));
+
+        it('B1: the bounce webhook refuses deliveries, opens and untyped bounces (400, nothing changes)', async () => {
+            const row = await logRepo().save(logRepo().create({
+                type: 't', recipient: 'strict@example.com', subject: 's', fromAddress: 'f@x', status: 'sent', tracked: true, channelId: 1, smtpMessageId: 'strict-1@shop',
+            } as Partial<EmailLog>));
+            for (const status of ['delivered', 'opened', 'sent', '']) {
+                expect((await bounce({ messageId: 'strict-1@shop', status })).status).toBe(400);
+            }
+            const untyped = await bounce({ messageId: 'strict-1@shop', status: 'bounced' });
+            expect(untyped.status).toBe(400);
+            expect((await untyped.json()).error).toContain('bounceType');
+            expect((await logRepo().findOne({ where: { id: row.id } }))!.status).toBe('sent');
+            expect(await supRepo().findOne({ where: { recipient: 'strict@example.com' } })).toBeNull();
+            // A hard bounce on a single-recipient email suppresses that address.
+            const ok = await bounce({ messageId: '<strict-1@shop>', status: 'bounced', bounceType: 'hard', reason: '550 no such user' });
+            expect(await ok.json()).toEqual({ ok: true, matched: true, suppressed: 1 });
+            expect((await logRepo().findOne({ where: { id: row.id } }))!.status).toBe('bounced');
+            expect(await supRepo().findOne({ where: { recipient: 'strict@example.com' } })).toMatchObject({ reason: 'hard-bounce' });
+        });
+
+        it('B1: per recipient — a comma-joined To list is never suppressed whole; a named recipient is', async () => {
+            await logRepo().save(logRepo().create({
+                type: 't', recipient: 'one@example.com, Two <two@example.com>', subject: 's', fromAddress: 'f@x', status: 'sent', tracked: true, channelId: 1, smtpMessageId: 'multi-1@shop',
+            } as Partial<EmailLog>));
+            expect(await (await bounce({ messageId: 'multi-1@shop', status: 'complained' })).json()).toMatchObject({ matched: true, suppressed: 0 });
+            expect(await supRepo().count()).toBeGreaterThan(0);
+            expect(await supRepo().findOne({ where: { recipient: 'one@example.com, two <two@example.com>' } })).toBeNull();
+            expect(await supRepo().findOne({ where: { recipient: 'one@example.com' } })).toBeNull();
+            // Not one of the email's recipients: not matched, nothing changes.
+            expect(await (await bounce({ messageId: 'multi-1@shop', status: 'bounced', bounceType: 'hard', recipient: 'stranger@example.com' })).json()).toMatchObject({ matched: false, suppressed: 0 });
+            expect(await (await bounce({ messageId: 'multi-1@shop', status: 'bounced', bounceType: 'hard', recipient: 'TWO@example.com' })).json()).toMatchObject({ matched: true, suppressed: 1 });
+            expect(await supRepo().findOne({ where: { recipient: 'two@example.com' } })).toBeTruthy();
+            expect(await supRepo().findOne({ where: { recipient: 'one@example.com' } })).toBeNull();
+            // A soft bounce never suppresses.
+            await logRepo().save(logRepo().create({
+                type: 't', recipient: 'full@example.com', subject: 's', fromAddress: 'f@x', status: 'sent', tracked: true, channelId: 1, smtpMessageId: 'soft-2@shop',
+            } as Partial<EmailLog>));
+            expect(await (await bounce({ messageId: 'soft-2@shop', status: 'bounced', bounceType: 'soft' })).json()).toMatchObject({ matched: true, suppressed: 0 });
+            expect(await supRepo().findOne({ where: { recipient: 'full@example.com' } })).toBeNull();
+        });
+
+        it('B7: the suppression list is enforced at send in the free tier; a password reset is exempt', async () => {
+            const tracking: EmailTrackingService = (server as any).app.get(EmailTrackingService);
+            await tracking.addSuppression('blocked@example.com', 'manual');
+            const blocked = await tracking.sendTracked(sendgridTransport(), { from: 'shop@example.com', to: 'Blocked <BLOCKED@example.com>', subject: 'Offer', html: '<p>x</p>' }, { type: 'marketing' });
+            expect(blocked.status).toBe('suppressed');
+            const reset = await tracking.sendTracked(sendgridTransport(), { from: 'shop@example.com', to: 'blocked@example.com', subject: 'Reset', html: '<p>x</p>' }, { type: 'password-reset' });
+            expect(reset.status).toBe('sent');
+            const partial = await tracking.sendTracked(sendgridTransport(), { from: 'shop@example.com', to: ['blocked@example.com', 'ok@example.com'], subject: 'Hi', html: '<p>x</p>' }, { type: 'note' });
+            expect(partial.status).toBe('sent');
+            expect(partial.errorMessage).toContain('blocked@example.com');
+            expect(await tracking.isSuppressed('blocked@example.com')).toBe(true);
+        });
+
+        it('suppression admin: validation, search with a total, remove', async () => {
+            const post = (body: any) => adminClient.fetch(`${BASE}/email-track/suppression`, { method: 'POST', body: JSON.stringify(body) });
+            expect((await post({ recipient: 'a@x.com, b@x.com' })).status).toBe(400);
+            expect((await post({ recipient: 'Jane <jane@x.com>' })).status).toBe(400);
+            expect((await post({ recipient: 'Jane@Example.com', reason: 'unsubscribe', note: 'asked by phone' })).status).toBe(201);
+            const list = await (await adminClient.fetch(`${BASE}/email-track/suppression?q=JANE&take=10`)).json();
+            expect(list.total).toBe(1);
+            expect(list.items[0]).toMatchObject({ recipient: 'jane@example.com', reason: 'unsubscribe', note: 'asked by phone' });
+            expect(await (await adminClient.fetch(`${BASE}/email-track/suppression/${encodeURIComponent('jane@example.com')}`, { method: 'DELETE' })).json()).toEqual({ ok: true });
+            expect((await (await adminClient.fetch(`${BASE}/email-track/suppression?q=jane`)).json()).total).toBe(0);
+        });
+
+        it('tracking switches: opens off → the pixel is served but nothing is recorded, new mail has no pixel; settings validated, SuperAdmin only', async () => {
+            const save = (body: any) => adminClient.fetch(`${BASE}/email-track/settings`, { method: 'POST', body: JSON.stringify(body) });
+            expect((await save({ trustedProxies: '10.0.0.0/8, not-an-ip' })).status).toBe(400);
+            expect((await save({ trackOpens: 'no' })).status).toBe(400);
+            expect(await (await adminClient.fetch(`${BASE}/email-track/settings`)).json()).toMatchObject({ trackOpens: true, trackClicks: true, configuredProxies: [] });
+            // sql.js cannot write the SDK's prefs table (MySQL / PostgreSQL SQL): the save says so instead of
+            // pretending (persistence is covered by mariadb.e2e-spec.ts). The switch itself, in-process:
+            expect((await save({ trackOpens: false })).status).toBe(500);
+            applyStoredPrefs({ 'tracking.opens': 'off' });
+            try {
+                const row = await logRepo().save(logRepo().create({ type: 't', recipient: 'sw@example.com', subject: 's', fromAddress: 'f@x', status: 'sent', tracked: true, channelId: 1 } as Partial<EmailLog>));
+                const token = signValue(String(row.id), getOptions().signingSecret!);
+                const px = await fetch(`${BASE}/email-track/open/${token}.gif`, { headers: { 'user-agent': 'Mozilla/5.0 (X11) AppleWebKit/537.36 Chrome/120 Safari/537.36' } });
+                expect(px.status).toBe(200);
+                await sleep(200);
+                expect((await logRepo().findOne({ where: { id: row.id } }))!.openCount).toBe(0);
+                const tracking: EmailTrackingService = (server as any).app.get(EmailTrackingService);
+                let wire = '';
+                const t = nodemailer.createTransport({ streamTransport: true, buffer: true });
+                const capture = { sendMail: async (m: any) => { wire = m.html; return t.sendMail(m); } } as any;
+                await tracking.sendTracked(capture, { from: 'shop@example.com', to: 'sw@example.com', subject: 's', html: '<a href="https://x.example/">x</a>' }, { type: 't' });
+                expect(wire).not.toContain('/email-track/open/');
+                expect(wire).toContain('/email-track/click/');
+            } finally {
+                resetStoredPrefs();
+            }
+            await adminClient.asUserWithCredentials('ch2@test.local', 'ch2-pass');
+            adminClient.setChannelToken('second-token');
+            try {
+                expect((await save({ trackOpens: false })).status).toBe(403);
+            } finally {
+                adminClient.setChannelToken(E2E_DEFAULT_CHANNEL_TOKEN);
+                await adminClient.asSuperAdmin();
+            }
+        });
+
+        it('privacy: export everything held about an address; erase it (suppression entry kept), DeleteCustomer only', async () => {
+            const tracking: EmailTrackingService = (server as any).app.get(EmailTrackingService);
+            const a = await tracking.sendTracked(sendgridTransport(), { from: 'shop@example.com', to: 'Privy <privy@example.com>', subject: 'Order 1', html: '<p>x</p>' }, { type: 'order-confirmation' });
+            const b = await tracking.sendTracked(sendgridTransport(), { from: 'shop@example.com', to: 'privy@example.com.au', subject: 'Other', html: '<p>x</p>' }, { type: 'order-confirmation' });
+            await tracking.addSuppression('privy@example.com', 'manual');
+            expect((await fetch(`${BASE}/email-track/privacy/export?email=privy@example.com`)).status).toBe(401);
+            expect((await adminClient.fetch(`${BASE}/email-track/privacy/export?email=not-an-address`)).status).toBe(400);
+            const exp = await adminClient.fetch(`${BASE}/email-track/privacy/export?email=PRIVY@example.com`);
+            expect(exp.status).toBe(200);
+            expect(exp.headers.get('cache-control')).toContain('no-store');
+            const data = await exp.json();
+            expect(data.emails.map((e: any) => e.id)).toEqual([Number(a.id)]);
+            expect(data.events.length).toBeGreaterThan(0);
+            expect(data.suppression).toMatchObject({ recipient: 'privy@example.com' });
+
+            const erase = (body: any) => adminClient.fetch(`${BASE}/email-track/privacy/erase`, { method: 'POST', body: JSON.stringify(body) });
+            expect((await erase({ email: 'privy@example.com' })).status).toBe(400); // confirm required
+            await adminClient.asUserWithCredentials('ch2@test.local', 'ch2-pass');
+            adminClient.setChannelToken('second-token');
+            try {
+                expect((await erase({ email: 'privy@example.com', confirm: true })).status).toBe(403);
+            } finally {
+                adminClient.setChannelToken(E2E_DEFAULT_CHANNEL_TOKEN);
+                await adminClient.asSuperAdmin();
+            }
+            const r = await (await erase({ email: 'privy@example.com', confirm: true })).json();
+            expect(r).toMatchObject({ email: 'privy@example.com', emails: 1, suppressionRetained: true });
+            expect(r.events).toBeGreaterThan(0);
+            expect(await logRepo().findOne({ where: { id: a.id } })).toBeNull();
+            expect(await logRepo().findOne({ where: { id: b.id } })).toBeTruthy();
+            expect(await conn().rawConnection.getRepository(EmailEvent).count({ where: { emailLogId: Number(a.id) } })).toBe(0);
+            expect(await supRepo().findOne({ where: { recipient: 'privy@example.com' } })).toBeTruthy();
+        });
+
+        it('weekly report and set-up checklist are premium; the per-order email list and the widget are free', async () => {
+            expect((await adminClient.fetch(`${BASE}/email-track/setup`)).status).toBe(402);
+            expect(await (await adminClient.fetch(`${BASE}/email-track/digest/settings`)).json()).toMatchObject({ locked: true });
+            expect((await adminClient.fetch(`${BASE}/email-track/digest/send-test`, { method: 'POST', body: '{}' })).status).toBe(402);
+            expect((await adminClient.fetch(`${BASE}/email-track/digest/preview`)).status).toBe(402);
+            expect((await adminClient.fetch(`${BASE}/email-track/digest/settings`, { method: 'POST', body: '{"enabled":false}' })).status).toBe(402);
+            const tracking: EmailTrackingService = (server as any).app.get(EmailTrackingService);
+            expect(await tracking.digest.tick(new Date(Date.now() + 30 * 86_400_000))).toBe(false);
+            const list = await adminClient.fetch(`${BASE}/email-track/log?orderId=${order.id}&fromDays=all`);
+            expect(list.status).toBe(200);
+            expect((await list.json()).total).toBeGreaterThan(0);
+            const widget = await (await adminClient.fetch(`${BASE}/email-track/widget`)).json();
+            expect(widget.stats.map((x: any) => x.label)).toEqual(['Emails tracked', 'Opens', 'Clicks', 'Failed or bounced']);
+            expect(widget.failedOrBounced).toBeGreaterThanOrEqual(1);
+            const status = await (await adminClient.fetch(`${BASE}/email-track/licence/status`)).json();
+            expect(status.premiumFeatures).toContain('Weekly email report');
+            expect(status.premiumFeatures.join(' ')).not.toMatch(/suppression/i);
+            setLicenceStatus({ valid: true, message: 'e2e licence' } as any);
+            try {
+                expect((await adminClient.fetch(`${BASE}/email-track/setup`)).status).toBe(200);
+                expect(await (await adminClient.fetch(`${BASE}/email-track/digest/settings`)).json()).toMatchObject({ locked: false });
+            } finally {
+                setLicenceStatus({ valid: false, message: 'e2e: free tier' } as any);
+            }
+        });
     });
 });
 

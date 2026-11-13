@@ -4,6 +4,7 @@ import { Request, Response } from 'express';
 import { PROVIDER_SLUGS } from './event-types';
 import { getOptions, hasPremiumAccess, ProviderWebhookOptions } from './options';
 import { getRealIp } from './proxy-headers';
+import { trustedProxyRanges } from './tracking-settings';
 
 /** Process-wide rate limiter shared by the public endpoints (open, click,
  *  bounce, the evidence PDF), keyed `<route>|<ip>`. Sized by `rateLimit`.
@@ -18,7 +19,7 @@ export function getLimiter(): RateLimiter {
 }
 
 export function realIp(req: Request): string | null {
-    return getRealIp(req, getOptions().trustedIpHeaders || []);
+    return getRealIp(req, getOptions().trustedIpHeaders || [], trustedProxyRanges());
 }
 
 /** Token buckets that can be checked without spending a token (the SDK limiter cannot). */
@@ -147,7 +148,7 @@ export function scopedChannel(ctx: RequestContext): number | null {
 
 /**
  * Session + permission gate for the admin REST endpoints. `write`: false →
- * ReadCustomer, true → UpdateCustomer, 'ops' → SuperAdmin, 'order' → ReadOrder
+ * ReadCustomer, true → UpdateCustomer, 'ops' → SuperAdmin, 'erase' → DeleteCustomer, 'order' → ReadOrder
  * AND ReadCustomer (order activity: Vendure's `userHasPermissions` is an OR,
  * so each permission is checked on its own).
  *
@@ -156,7 +157,7 @@ export function scopedChannel(ctx: RequestContext): number | null {
  * `.pdf`, `.js` …) must never keep an admin response and serve it to someone
  * else — and the licence SDK's security headers.
  */
-export function requireAdmin(ctx: RequestContext, res: Response, write: boolean | 'ops' | 'order' = false): boolean {
+export function requireAdmin(ctx: RequestContext, res: Response, write: boolean | 'ops' | 'order' | 'erase' = false): boolean {
     if (typeof (res as any)?.setHeader === 'function') {
         res.setHeader('Cache-Control', 'private, no-store');
         applySecurityHeaders(res);
@@ -169,6 +170,8 @@ export function requireAdmin(ctx: RequestContext, res: Response, write: boolean 
     let ok: boolean;
     if (!isAdminApiSession(ctx)) {
         ok = false;
+    } else if (write === 'erase') {
+        ok = ctx.userHasPermissions([Permission.DeleteCustomer]);
     } else if (write === 'order') {
         ok = ctx.userHasPermissions([Permission.ReadOrder]) && ctx.userHasPermissions([Permission.ReadCustomer]);
     } else {

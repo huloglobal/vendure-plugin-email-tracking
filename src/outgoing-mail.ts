@@ -13,16 +13,19 @@ import { getOptions, ownTrackingPrefixes, trackingBaseUrl } from './options';
  * events. The URLs and their signatures are exactly what 0.15.x produced.
  * `signed` says whether the pixel and click tokens carry an HMAC (always,
  * once a signing secret exists), so a later hit on the bare id of this email
- * can be recognised as forged.
+ * can be recognised as forged. `kinds` (0.17.0, the tracking switches):
+ * `clicks: false` leaves the links alone, `opens: false` adds no pixel.
  */
-export function wrapTrackedHtml(html: string, eventId: number): { html: string; links: LinkMeta[]; signed: boolean } {
+export function wrapTrackedHtml(html: string, eventId: number, kinds: { opens?: boolean; clicks?: boolean } = {}): { html: string; links: LinkMeta[]; signed: boolean } {
+    const opens = kinds.opens !== false;
+    const clicks = kinds.clicks !== false;
     const base = trackingBaseUrl();
     const ownPrefixes = ownTrackingPrefixes();
     // Signed when a secret exists, so nobody can enumerate ids to forge opens/clicks.
     const secret = getOptions().signingSecret;
     const token = secret ? signValue(String(eventId), secret) : String(eventId);
     const links: LinkMeta[] = [];
-    const rewritten = html.replace(/<a\b([^>]*?)\bhref\s*=\s*(["'])(.*?)\2/gi, (m: string, attrs: string, q: string, url: string, offset: number) => {
+    const rewritten = !clicks ? html : html.replace(/<a\b([^>]*?)\bhref\s*=\s*(["'])(.*?)\2/gi, (m: string, attrs: string, q: string, url: string, offset: number) => {
         const trimmed = String(url).trim();
         if (!trimmed) return m;
         if (/^(mailto:|tel:|#)/i.test(trimmed)) return m;
@@ -38,7 +41,7 @@ export function wrapTrackedHtml(html: string, eventId: number): { html: string; 
         return `<a${attrs}href=${q}${trackedClickHref(base, token, target, secret)}${q}`;
     });
     const pixel = `<img src="${base}/email-track/open/${token}.gif" width="1" height="1" alt="" border="0" style="border:0;width:1px;height:1px;opacity:0;overflow:hidden">`;
-    const out = /<\/body>/i.test(rewritten) ? rewritten.replace(/<\/body>/i, `${pixel}</body>`) : rewritten + pixel;
+    const out = !opens ? rewritten : /<\/body>/i.test(rewritten) ? rewritten.replace(/<\/body>/i, `${pixel}</body>`) : rewritten + pixel;
     return { html: out, links, signed: !!secret };
 }
 

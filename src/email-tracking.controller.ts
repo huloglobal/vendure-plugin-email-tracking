@@ -17,6 +17,8 @@ import { dateParam, deliveryEventsUnavailable, getLimiter, intParam, realIp, req
 import { verifyClickSignature } from './click-signature';
 import { csvCell, CSV_BOM } from './csv';
 import { redactSensitiveUrl } from './link-meta';
+import { isAddress, normaliseAddress, parseBounceBody } from './recipients';
+import { currentSettings, trackingSwitches } from './tracking-settings';
 import {
     ATTEMPT_COLUMNS, ATTEMPT_STATES, AttemptInfo, attemptInfosFor, AttemptState, mayHaveRetry, SendClock, sendClock, SENDING_SQL, sendingSince,
     sqlTime, stateFields, STORED_STATES, TimelineStart, UNKNOWN_SQL, unknownParams, UNSETTLED_SQL, unsettledSince,
@@ -155,6 +157,8 @@ export class EmailTrackingController {
     @Get('setup')
     async setup(@Ctx() ctx: RequestContext, @Res() res: Response) {
         if (!requireAdmin(ctx, res, false)) return;
+        // Premium since 0.17.0 (licence or evaluation).
+        if (!hasPremiumAccess()) return res.status(402).json(premiumFeatureError(PLUGIN_ID_FOR_STORE));
         return res.json(await this.tracking.setupChecklist());
     }
 
@@ -167,15 +171,17 @@ export class EmailTrackingController {
 
     // ── Weekly report ──────────────────────────────────────────────────
 
+    /** The settings read in every tier (`locked`: premium is off, so no report is sent; the settings are kept). */
     @Get('digest/settings')
     async digestSettings(@Ctx() ctx: RequestContext, @Res() res: Response) {
         if (!requireAdmin(ctx, res, false)) return;
-        return res.json(await this.tracking.digestSettings());
+        return res.json({ ...(await this.tracking.digestSettings()), locked: !hasPremiumAccess() });
     }
 
     @Post('digest/settings')
     async digestUpdateSettings(@Ctx() ctx: RequestContext, @Res() res: Response, @Body() body: any) {
         if (!requireAdmin(ctx, res, true)) return;
+        if (!hasPremiumAccess()) return res.status(402).json(premiumFeatureError(PLUGIN_ID_FOR_STORE));
         const patch: { enabled?: boolean; recipient?: string | null } = {};
         if (typeof body?.enabled === 'boolean') patch.enabled = body.enabled;
         if (body && 'recipient' in body) patch.recipient = body.recipient === null ? null : String(body.recipient ?? '');
@@ -189,6 +195,7 @@ export class EmailTrackingController {
     @Post('digest/send-test')
     async digestSendTest(@Ctx() ctx: RequestContext, @Res() res: Response, @Body() body: any) {
         if (!requireAdmin(ctx, res, true)) return;
+        if (!hasPremiumAccess()) return res.status(402).json(premiumFeatureError(PLUGIN_ID_FOR_STORE));
         const to = body?.to ? String(body.to).trim().slice(0, 320) : undefined;
         if (to && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(to)) return res.status(400).json({ error: 'bad-request', message: 'Enter a valid email address' });
         const r = await this.tracking.digest.sendNow(to);
@@ -199,6 +206,7 @@ export class EmailTrackingController {
     @Get('digest/preview')
     async digestPreview(@Ctx() ctx: RequestContext, @Res() res: Response) {
         if (!requireAdmin(ctx, res, false)) return;
+        if (!hasPremiumAccess()) return res.status(402).json(premiumFeatureError(PLUGIN_ID_FOR_STORE));
         const mail = await this.tracking.digestPreview();
         res.setHeader('Content-Type', 'text/html; charset=utf-8');
         return res.send(mail.html);
@@ -339,10 +347,10 @@ export class EmailTrackingController {
 
         const resolved = this.resolveSignedId(token);
         const id = resolved?.id ?? null;
-        if (id !== null && hasPremiumAccess()) {
-            // Open tracking is a paid feature. Unlicensed installs still
-            // serve the pixel (so emails don't show a broken image) but
-            // do not record the open. A bare id is recorded as unsigned (or
+        if (id !== null && trackingSwitches().opens) {
+            // Free since 0.17.0. With open tracking switched off the pixel is
+            // still served (an email sent earlier never shows a broken image)
+            // but nothing is recorded. A bare id is recorded as unsigned (or
             // not at all when the email's own links were signed).
             this.tracking.recordOpen(id, ip, req.headers['user-agent'] as string || null, { signed: !!resolved?.signed })
                 .catch((e: any) => Logger.warn(`open log fail #${id}: ${e?.message}`, loggerCtx));
@@ -413,9 +421,9 @@ export class EmailTrackingController {
                 return res.status(400).send('Invalid redirect target');
             }
         }
-        if (id !== null && hasPremiumAccess()) {
-            // Click tracking is paid. Unlicensed mode still redirects
-            // (we don't break the customer's email) but doesn't log.
+        if (id !== null && trackingSwitches().clicks) {
+            // Free since 0.17.0. With click tracking switched off the link
+            // still redirects (we don't break the customer's email) but nothing is recorded.
             // Recorded after the redirect is on its way: a slow lookup or
             // database never holds the customer up.
             this.tracking.recordClick(id, url, ip, req.headers['user-agent'] as string || null, undefined, { signed: !!resolved?.signed })
@@ -438,7 +446,8 @@ export class EmailTrackingController {
         if (!this.links.verifyClickDestination(token, url, sig) || !this.links.destinationMatches(link, url)) {
             return res.status(400).send('Invalid redirect target');
         }
-        if (link.emailLogId && link.isTrackingEnabled !== false && hasPremiumAccess()) {
+        // Links minted through the link API belong to their email whatever the switches say (as on WordPress).
+        if (link.emailLogId && link.isTrackingEnabled !== false) {
             const recorded = link.isSensitive ? (link.destinationUrlRedacted || `[sensitive: ${link.destinationUrlHost || 'unknown'}]`) : url;
             // Fire-and-forget, as for the pixel: the redirect never waits on the recording.
             this.tracking.recordClick(Number(link.emailLogId), recorded, ip, req.headers['user-agent'] as string || null,
@@ -483,11 +492,11 @@ export class EmailTrackingController {
      * `<...@domain>` value Gmail returned at submit time.
      *
      * POST /email-track/bounce
-     * Body: { messageId, status: 'bounced'|'complained', reason? }
+     * Body: { messageId, status: 'bounced'|'complained', bounceType: 'hard'|'soft' (bounces),
+     *         recipient?, reason? }
      *
-     * Currently unauthenticated to keep the integration simple — gate
-     * behind a shared secret header if you expose the endpoint to the
-     * public internet (it's fine on a private network).
+     * HMAC-signed (`X-Signature`, `bounceWebhookSecret`). Since 0.17.0 any
+     * other status, or a bounce without a hard / soft type, is refused 400.
      */
     @Post('bounce')
     async bounce(@Body() body: any, @Req() req: Request, @Res() res: Response) {
@@ -532,13 +541,14 @@ export class EmailTrackingController {
         if (!messageId || messageId.length > 500) {
             return res.status(400).json({ error: 'messageId required' });
         }
-        const status = body?.status === 'complained' ? 'complained' : 'bounced';
-        // A soft/transient bounce (mailbox full, greylisting) is recorded but never suppresses the address.
-        const bounceType = String(body?.bounceType || 'hard').toLowerCase();
-        const soft = status === 'bounced' && (bounceType === 'soft' || bounceType === 'transient');
-        const reason = body?.reason ? String(body.reason).slice(0, 2000) : undefined;
-        const ok = await this.tracking.recordBounce(messageId, status, reason, { soft });
-        return res.json({ ok, matched: ok });
+        // Strict (0.17.0, as the WordPress plugin): only a bounce that says hard or soft, or a
+        // complaint, is recorded. A relay forwarding deliveries or opens, or passing its
+        // provider's own words, gets 400 and changes nothing. A soft bounce never suppresses.
+        const parsed = parseBounceBody(body);
+        if (!parsed.ok) return res.status(400).json({ error: parsed.error });
+        const reason = body?.reason ? String(body.reason).replace(/[\u0000-\u001f\u007f]+/g, ' ').trim().slice(0, 2000) : undefined;
+        const r = await this.tracking.recordBounceReport(messageId, parsed.status, reason, { soft: parsed.soft, recipient: parsed.recipient });
+        return res.json({ ok: r.matched, matched: r.matched, suppressed: r.suppressed });
     }
 
     /**
@@ -824,20 +834,27 @@ export class EmailTrackingController {
         return res.json({ ...row, clicks, opens, clicksJson: undefined, opensJson: undefined });
     }
 
-    /** Admin: list suppression entries. */
+    /**
+     * Admin: the suppression list, newest first. `q` searches the address
+     * (substring), `take` (1–500, default 100) and `skip` page it; `total`
+     * counts every match.
+     */
     @Get('suppression')
     async listSuppression(@Ctx() ctx: RequestContext, @Req() req: Request, @Res() res: Response) {
         if (!requireAdmin(ctx, res, false)) return;
-        const take = Math.min(parseInt(String((req.query as any).take), 10) || 200, 1000);
-        const recipient = (req.query as any).recipient;
-        const rows = recipient
-            ? await this.connection.rawConnection.getRepository(EmailSuppression).find({
-                where: { recipient: String(recipient).toLowerCase() }, take,
-            })
-            : await this.connection.rawConnection.getRepository(EmailSuppression).find({
-                order: { id: 'DESC' }, take,
-            });
-        return res.json({ items: rows, total: rows.length });
+        const q = req.query as any;
+        const take = intParam(q.take, 1, 500) ?? 100;
+        const skip = intParam(q.skip, 0, 10_000_000) ?? 0;
+        const search = String(q.q ?? q.recipient ?? '').trim().toLowerCase().slice(0, 190);
+        const db = adapterFor(this.connection.rawConnection);
+        const suppressionWhere = search ? ' WHERE recipient LIKE ?' : '';
+        const params = search ? [`%${search.replace(/[\\%_]/g, m => '\\' + m)}%`] : [];
+        const items = await db.query(
+            `SELECT id, \`createdAt\`, recipient, reason, note, \`channelId\` FROM email_suppression${suppressionWhere} ORDER BY id DESC LIMIT ? OFFSET ?`,
+            [...params, take, skip],
+        );
+        const counted = await db.query(`SELECT COUNT(*) AS n FROM email_suppression${suppressionWhere}`, params);
+        return res.json({ items: items || [], total: Number(counted?.[0]?.n) || 0, take, skip });
     }
 
     /** Admin: manually suppress a recipient (e.g. when the customer asks
@@ -845,8 +862,9 @@ export class EmailTrackingController {
     @Post('suppression')
     async addSuppression(@Ctx() ctx: RequestContext, @Body() body: any, @Res() res: Response) {
         if (!requireAdmin(ctx, res, true)) return;
-        const recipient = String(body?.recipient || '').trim().slice(0, 320);
-        if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(recipient)) return res.status(400).json({ error: 'Valid recipient required' });
+        const raw = String(body?.recipient || '').trim().slice(0, 320);
+        if (!isAddress(raw)) return res.status(400).json({ error: 'Valid recipient required (one email address)' });
+        const recipient = normaliseAddress(raw);
         const reason = String(body?.reason || 'manual');
         if (!['hard-bounce', 'complaint', 'manual', 'unsubscribe'].includes(reason)) return res.status(400).json({ error: 'reason must be hard-bounce, complaint, manual or unsubscribe' });
         const channelId = body?.channelId === undefined || body?.channelId === null || body?.channelId === '' ? undefined : intParam(body.channelId, 1, 2147483647);
@@ -869,5 +887,54 @@ export class EmailTrackingController {
         if (!requireAdmin(ctx, res, true)) return;
         const removed = await this.tracking.removeSuppression(recipient);
         return res.json({ ok: removed });
+    }
+
+    // ── Settings (0.17.0): tracking switches + trusted proxies ─────────
+
+    @Get('settings')
+    async getSettings(@Ctx() ctx: RequestContext, @Res() res: Response) {
+        if (!requireAdmin(ctx, res, false)) return;
+        await this.tracking.refreshSettings();
+        return res.json(currentSettings());
+    }
+
+    /** `{ trackOpens?, trackClicks?, trustedProxies? }` — SuperAdmin (trusted proxies decide whose address the rate limits see). */
+    @Post('settings')
+    async saveSettings(@Ctx() ctx: RequestContext, @Body() body: any, @Res() res: Response) {
+        if (!requireAdmin(ctx, res, 'ops')) return;
+        const r = await this.tracking.updateSettings(body);
+        if ('error' in r) return res.status(r.status || 400).json({ error: r.error });
+        return res.json(currentSettings());
+    }
+
+    // ── Privacy (0.17.0): export / erase by address ─────────────────────
+
+    /** Everything held about one address, as a JSON download. ReadCustomer. */
+    @Get('privacy/export')
+    async privacyExport(@Ctx() ctx: RequestContext, @Query('email') email: string, @Res() res: Response) {
+        if (!requireAdmin(ctx, res, false)) return;
+        if (!isAddress(String(email || '').trim())) return res.status(400).json({ error: 'email must be one email address' });
+        const out = await this.tracking.privacyExport(String(email));
+        if (!out) return res.status(400).json({ error: 'email must be one email address' });
+        const safe = out.email.replace(/[^a-z0-9._-]+/gi, '_').slice(0, 80);
+        res.setHeader('Content-Disposition', `attachment; filename="email-tracking-${safe}-${new Date().toISOString().slice(0, 10)}.json"`);
+        return res.json(out);
+    }
+
+    /** Erase the emails, events and links of one address (its suppression entry is kept). DeleteCustomer. */
+    @Post('privacy/erase')
+    async privacyErase(@Ctx() ctx: RequestContext, @Body() body: any, @Res() res: Response) {
+        if (!requireAdmin(ctx, res, 'erase')) return;
+        const email = String(body?.email || '').trim();
+        if (!isAddress(email)) return res.status(400).json({ error: 'email must be one email address' });
+        if (body?.confirm !== true) return res.status(400).json({ error: 'confirm: true is required (erasing cannot be undone)' });
+        const out = await this.tracking.privacyErase(email);
+        if (!out) return res.status(400).json({ error: 'email must be one email address' });
+        return res.json({
+            ...out,
+            message: out.suppressionRetained
+                ? 'The address stays on the suppression list, the record that it must not be emailed. Remove it from the list if it should be erased as well.'
+                : undefined,
+        });
     }
 }

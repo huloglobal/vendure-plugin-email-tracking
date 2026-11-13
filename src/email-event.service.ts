@@ -1,6 +1,6 @@
 import { Injectable, OnApplicationBootstrap } from '@nestjs/common';
 import { Logger, TransactionalConnection } from '@vendure/core';
-import { adapterFor, classifyEmailEvent } from '@huloglobal/vendure-licence-sdk';
+import { adapterFor } from '@huloglobal/vendure-licence-sdk';
 import { createHmac } from 'crypto';
 import { In, IsNull, Not } from 'typeorm';
 import { EmailEvent } from './email-event.entity';
@@ -15,6 +15,7 @@ import { eventHashKey, getOptions } from './options';
 import { parseEmailClient } from './parse-ua';
 import { bareMessageId, dedupeKeyFor, ProviderEvent, SuppressionReason } from './webhook-mappers';
 import { correlationIdFrom } from './outgoing-mail';
+import { classifyEngagement } from './engagement-class';
 import { findLink, LinkMeta, redactSensitiveUrl } from './link-meta';
 
 const loggerCtx = 'EmailEventService';
@@ -239,7 +240,7 @@ export class EmailEventService implements OnApplicationBootstrap {
         let classification: string | null = null;
         let reasons: string[] = [];
         if (engagement) {
-            const cls = classifyEmailEvent({ userAgent: ua, eventType: input.type === 'open' ? 'email_open' : 'email_click' });
+            const cls = classifyEngagement(input.type as 'open' | 'click', ua, ip);
             // A bare id proves nothing about who fetched it: never human or machine, the UA reasons kept as chips.
             classification = input.unsigned ? UNVERIFIED : cls.classification;
             reasons = input.unsigned ? [UNSIGNED_REASON, ...cls.reasons.filter(r => r !== UNSIGNED_REASON)] : cls.reasons;
@@ -440,16 +441,14 @@ export class EmailEventService implements OnApplicationBootstrap {
         if (!enricher || !ip || isPrivateOrReservedIp(ip)) return;
         const cached = enricher.peek(ip);
         const p = cached !== undefined ? Promise.resolve(cached) : enricher.lookup(ip);
-        p.then(r => (r ? this.applyEnrichment(eventId, r, userAgent, type, geo) : undefined))
+        p.then(r => (r ? this.applyEnrichment(eventId, r, userAgent, type, geo, ip) : undefined))
             .catch((e: any) => Logger.verbose(`enrichment write skipped (event ${eventId}): ${e?.message}`, loggerCtx));
     }
 
     /** Store the enrichment on the row and re-classify with the IP flags. */
-    async applyEnrichment(eventId: number, r: ClampedEnrichment, userAgent: string | null, type: 'open' | 'click', geo: GeoLookup | null): Promise<void> {
-        const cls = classifyEmailEvent({
-            userAgent,
+    async applyEnrichment(eventId: number, r: ClampedEnrichment, userAgent: string | null, type: 'open' | 'click', geo: GeoLookup | null, ip: string | null = null): Promise<void> {
+        const cls = classifyEngagement(type, userAgent, ip, {
             ipIsProxy: r.isProxy, ipIsVpn: r.isVpn, ipIsTor: r.isTor, ipIsDatacentre: r.isHosting, ipOrg: r.org,
-            eventType: type === 'open' ? 'email_open' : 'email_click',
         });
         const patch: Partial<EmailEvent> = {
             asn: r.asn, org: r.org, isProxy: r.isProxy, isVpn: r.isVpn, isTor: r.isTor, isHosting: r.isHosting, isMobile: r.isMobile,

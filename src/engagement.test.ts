@@ -79,10 +79,15 @@ describe('buildSetupItems', () => {
 });
 
 describe('PREMIUM_FEATURES', () => {
-    it('lists the paid capabilities', () => {
+    it('lists exactly the gated capabilities (0.17.0: opens, clicks and suppression are free; weekly report and checklist premium)', () => {
         expect(PREMIUM_FEATURES).toEqual([
-            'Open and click tracking', 'Per-template open and click rates', 'CSV export', 'Suppression list',
-            'Order email activity and evidence report', 'Provider delivery, deferral and unsubscribe events',
+            'Per-template open and click rates',
+            'CSV export of the email log',
+            'Order email activity timeline and PDF evidence report',
+            'Provider delivery, deferral, unsubscribe and engagement events',
+            'Weekly email report',
+            'Setup checklist',
         ]);
+        expect(PREMIUM_FEATURES.join(' ')).not.toMatch(/suppression|open and click tracking/i);
     });
 });
