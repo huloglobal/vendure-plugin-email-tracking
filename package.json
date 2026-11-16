@@ -45,7 +45,7 @@
         "@types/nodemailer": "^6.4.24",
         "@vendure/core": "3.8.2",
         "@vendure/email-plugin": "3.8.2",
-        "nodemailer": "^6.10.1",
+        "nodemailer": "^10.5.0",
         "typeorm": "^0.3.30",
         "typescript": "^5.9.3",
         "vitest": "^2.1.9"
