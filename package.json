@@ -47,7 +47,7 @@
         "@vendure/email-plugin": "3.8.2",
         "nodemailer": "^6.10.1",
         "typeorm": "^0.3.30",
-        "typescript": "^5.9.3",
+        "typescript": "^7.0.2",
         "vitest": "^2.1.9"
     },
     "keywords": [
