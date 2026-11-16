@@ -632,6 +632,10 @@ The free ip-api endpoint logs a warning at boot: it is plain HTTP, limited to
   (`total` counts every match), `POST` `{ recipient, reason?, note? }`
   (one address; `manual`, `unsubscribe`, `hard-bounce`, `complaint`),
   `DELETE /email-track/suppression/:recipient`.
+- **Channel admins (0.18.0):** the list applies to every channel, but an
+  administrator whose role is limited to other channels than the default one
+  sees, adds and removes only their own channel's entries (an entry they add
+  is stamped with their channel). Default-channel administrators see them all.
 
 ### Email type from the sender (0.17.0)
 

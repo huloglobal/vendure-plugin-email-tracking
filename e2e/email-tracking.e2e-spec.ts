@@ -886,6 +886,42 @@ describe('@huloglobal/vendure-plugin-email-tracking', () => {
             expect((await (await adminClient.fetch(`${BASE}/email-track/suppression?q=jane`)).json()).total).toBe(0);
         });
 
+        it('0.18.0: a channel admin sees and lifts only their own channel\'s suppressions; their additions are stamped with their channel', async () => {
+            await adminClient.asSuperAdmin();
+            const zones: any = await adminClient.query(gql`query { zones { items { id } } }`);
+            const zoneId = zones.zones.items[0].id;
+            const ch: any = await adminClient.query(gql`mutation($input: CreateChannelInput!) { createChannel(input: $input) { ... on Channel { id } } }`, {
+                input: { code: 'third', token: 'third-token', defaultLanguageCode: 'en', pricesIncludeTax: true, defaultCurrencyCode: 'GBP', defaultShippingZoneId: zoneId, defaultTaxZoneId: zoneId },
+            });
+            const ch3 = num(ch.createChannel.id);
+            const role: any = await adminClient.query(gql`mutation($input: CreateRoleInput!) { createRole(input: $input) { id } }`, {
+                input: { code: 'ch3-editor', description: 'ch3 editor', permissions: ['ReadCustomer', 'UpdateCustomer'], channelIds: [ch.createChannel.id] },
+            });
+            await adminClient.query(gql`mutation($input: CreateAdministratorInput!) { createAdministrator(input: $input) { id } }`, {
+                input: { firstName: 'C', lastName: 'Three', emailAddress: 'ch3@test.local', password: 'ch3-pass', roleIds: [role.createRole.id] },
+            });
+            const post = (body: any) => adminClient.fetch(`${BASE}/email-track/suppression`, { method: 'POST', body: JSON.stringify(body) });
+            expect((await post({ recipient: 'other-channel@example.com', reason: 'manual' })).status).toBe(201);
+
+            await adminClient.asUserWithCredentials('ch3@test.local', 'ch3-pass');
+            adminClient.setChannelToken('third-token');
+            try {
+                expect((await post({ recipient: 'mine@example.com', reason: 'manual', channelId: 1 })).status).toBe(201);
+                const list = await (await adminClient.fetch(`${BASE}/email-track/suppression?take=500`)).json();
+                expect(list.items.map((i: any) => i.recipient)).toEqual(['mine@example.com']);
+                expect(num(list.items[0].channelId)).toBe(ch3);
+                const del = (r: string) => adminClient.fetch(`${BASE}/email-track/suppression/${encodeURIComponent(r)}`, { method: 'DELETE' });
+                expect(await (await del('other-channel@example.com')).json()).toEqual({ ok: false });
+                expect(await (await del('mine@example.com')).json()).toEqual({ ok: true });
+            } finally {
+                adminClient.setChannelToken(E2E_DEFAULT_CHANNEL_TOKEN);
+                await adminClient.asSuperAdmin();
+            }
+            const all = await (await adminClient.fetch(`${BASE}/email-track/suppression?q=other-channel`)).json();
+            expect(all.total).toBe(1);
+            expect(await (await adminClient.fetch(`${BASE}/email-track/suppression/${encodeURIComponent('other-channel@example.com')}`, { method: 'DELETE' })).json()).toEqual({ ok: true });
+        });
+
         it('tracking switches: opens off → the pixel is served but nothing is recorded, new mail has no pixel; settings validated, SuperAdmin only', async () => {
             const save = (body: any) => adminClient.fetch(`${BASE}/email-track/settings`, { method: 'POST', body: JSON.stringify(body) });
             expect((await save({ trustedProxies: '10.0.0.0/8, not-an-ip' })).status).toBe(400);

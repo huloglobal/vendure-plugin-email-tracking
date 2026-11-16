@@ -169,7 +169,7 @@ const SEED = [
 /** Stand-in for a `${expr}` interpolation inside an SQL template literal. */
 function standIn(expr: string): string {
     const e = expr.trim();
-    if (e === 'suppressionWhere') return ' WHERE recipient LIKE ?';
+    if (e === 'suppressionWhere') return ' WHERE recipient LIKE ? AND `channelId` = ?';
     if (/^(w|\w*Clause)$/.test(e)) return ' WHERE `customerId` = ? AND recipient LIKE ? AND `createdAt` >= ?';
     // The shared fragments of send-attempts.ts, as they are.
     if (/^(columns|ATTEMPT_COLUMNS)$/.test(e)) return ATTEMPT_COLUMNS;

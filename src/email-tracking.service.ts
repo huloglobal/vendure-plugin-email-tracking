@@ -1219,9 +1219,11 @@ export class EmailTrackingService implements OnApplicationBootstrap, OnModuleDes
         });
     }
 
-    async removeSuppression(recipient: string): Promise<boolean> {
+    /** Lift a suppression; with `channelId` (a channel admin) only that channel's entry. */
+    async removeSuppression(recipient: string, channelId?: number | null): Promise<boolean> {
         const repo = this.connection.rawConnection.getRepository(EmailSuppression);
-        const res = await repo.delete({ recipient: normaliseAddress(recipient) || recipient.trim().toLowerCase() });
+        const key = normaliseAddress(recipient) || recipient.trim().toLowerCase();
+        const res = await repo.delete(channelId ? { recipient: key, channelId } as any : { recipient: key });
         return !!(res.affected && res.affected > 0);
     }
 

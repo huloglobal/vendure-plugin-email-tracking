@@ -5,6 +5,25 @@ documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) and this project
 adheres to [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.18.0] — 2026-11-16
+
+### Fixed
+- **Channel admins no longer see or lift other channels' suppressions.** The suppression list is install-wide,
+  and its admin routes showed every address on it, and let any administrator with Update Customer on any
+  channel lift any entry, including those of other channels' customers. An administrator whose active channel
+  is not the default channel now lists and removes only that channel's entries, and an entry they add is
+  stamped with their channel. Default-channel administrators see and manage the whole list, as before.
+  Enforcement at send is unchanged (every entry applies to every channel).
+
+### Changed
+- Dependencies: development dependencies refreshed to their latest minor/patch versions (`@nestjs/common`
+  12.5, `nodemailer` 6.10, `typeorm` 0.3.30, `typescript` 5.9, `vitest` 2.1.9 and types).
+
+### Notes
+- The plugin sends no e-mails of its own apart from the weekly report, which is built by
+  `@huloglobal/vendure-licence-sdk`. It never wraps or restyles the e-mails your store sends; it only adds
+  the open pixel and click redirects you have switched on.
+
 ## [0.17.0] — 2026-11-13
 
 Parity with the WordPress plugin: the core of email tracking is free, the

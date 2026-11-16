@@ -184,3 +184,15 @@ export function requireAdmin(ctx: RequestContext, res: Response, write: boolean 
     }
     return true;
 }
+
+/**
+ * WHERE clause for the suppression list: an optional address search and, for a channel admin
+ * (`scope` = their channel), only that channel's entries. The default channel's admins see all.
+ */
+export function suppressionFilter(search: string, scope: number | null): { where: string; params: any[] } {
+    const parts: string[] = [];
+    const params: any[] = [];
+    if (search) { parts.push('recipient LIKE ?'); params.push(`%${search.replace(/[\\%_]/g, m => '\\' + m)}%`); }
+    if (scope) { parts.push('`channelId` = ?'); params.push(scope); }
+    return { where: parts.length ? ` WHERE ${parts.join(' AND ')}` : '', params };
+}

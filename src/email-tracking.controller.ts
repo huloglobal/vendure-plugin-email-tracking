@@ -13,7 +13,7 @@ import { EmailTrackingService, PREMIUM_FEATURES, effectiveTier, recentStatLines 
 import { EmailLinkService } from './email-link.service';
 import { EmailTrackingPlugin } from './plugin';
 import { getOptions, getLicenceStatus, hasPremiumAccess, getEvalState, getEvalInstanceId, configuredSigningSecret } from './options';
-import { dateParam, deliveryEventsUnavailable, getLimiter, intParam, realIp, requireAdmin, scopedChannel } from './http-helpers';
+import { dateParam, deliveryEventsUnavailable, getLimiter, intParam, realIp, requireAdmin, scopedChannel, suppressionFilter } from './http-helpers';
 import { verifyClickSignature } from './click-signature';
 import { csvCell, CSV_BOM } from './csv';
 import { redactSensitiveUrl } from './link-meta';
@@ -847,8 +847,7 @@ export class EmailTrackingController {
         const skip = intParam(q.skip, 0, 10_000_000) ?? 0;
         const search = String(q.q ?? q.recipient ?? '').trim().toLowerCase().slice(0, 190);
         const db = adapterFor(this.connection.rawConnection);
-        const suppressionWhere = search ? ' WHERE recipient LIKE ?' : '';
-        const params = search ? [`%${search.replace(/[\\%_]/g, m => '\\' + m)}%`] : [];
+        const { where: suppressionWhere, params } = suppressionFilter(search, scopedChannel(ctx));
         const items = await db.query(
             `SELECT id, \`createdAt\`, recipient, reason, note, \`channelId\` FROM email_suppression${suppressionWhere} ORDER BY id DESC LIMIT ? OFFSET ?`,
             [...params, take, skip],
@@ -867,8 +866,11 @@ export class EmailTrackingController {
         const recipient = normaliseAddress(raw);
         const reason = String(body?.reason || 'manual');
         if (!['hard-bounce', 'complaint', 'manual', 'unsubscribe'].includes(reason)) return res.status(400).json({ error: 'reason must be hard-bounce, complaint, manual or unsubscribe' });
-        const channelId = body?.channelId === undefined || body?.channelId === null || body?.channelId === '' ? undefined : intParam(body.channelId, 1, 2147483647);
+        let channelId = body?.channelId === undefined || body?.channelId === null || body?.channelId === '' ? undefined : intParam(body.channelId, 1, 2147483647);
         if (body?.channelId && channelId === null) return res.status(400).json({ error: 'channelId must be a positive integer' });
+        // A channel admin's entry is always their own channel's (0.18.0).
+        const scope = scopedChannel(ctx);
+        if (scope) channelId = scope;
         const row = await this.tracking.addSuppression(
             recipient,
             reason,
@@ -885,7 +887,9 @@ export class EmailTrackingController {
     @Delete('suppression/:recipient')
     async deleteSuppression(@Ctx() ctx: RequestContext, @Param('recipient') recipient: string, @Res() res: Response) {
         if (!requireAdmin(ctx, res, true)) return;
-        const removed = await this.tracking.removeSuppression(recipient);
+        // A channel admin may lift only their own channel's entries (0.18.0): the list is install-wide
+        // and its other rows are other channels' customers.
+        const removed = await this.tracking.removeSuppression(recipient, scopedChannel(ctx));
         return res.json({ ok: removed });
     }
 
